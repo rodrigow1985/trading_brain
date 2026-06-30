@@ -1,0 +1,12 @@
+.env
+.git/
+.claude/
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite
+.venv/
+venv/
+data/
+docs/
+tests/

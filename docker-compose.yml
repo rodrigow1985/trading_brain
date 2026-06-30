@@ -1,0 +1,19 @@
+services:
+  brain:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: python scripts/hello.py  # reemplazar según la fase activa
+
+  # Fase 1 — verificar armador de contexto
+  # command: python scripts/fase1_checkpoint.py
+
+  # Fase 3 — validación pasiva
+  # command: python scripts/validate_brain.py
+
+  # Fase 4 — loop paper end-to-end
+  # command: python scripts/run_scheduler.py
+  # o también:
+  # command: python -m src.scheduler
