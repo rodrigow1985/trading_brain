@@ -69,31 +69,21 @@ def _notificar_resultados(resultados: list[dict]) -> None:
     for r in resultados:
         par = r["par"]
         metricas = r["metricas_4h"]
-        decision = r["decision"]
+        analisis = r["analisis"]
 
         try:
-            notifier.notificar_scanner_match(
+            notifier.notificar_scanner(
                 par=par,
                 precio=metricas["precio"],
                 ema20=metricas["ema20"],
                 dist_ema20_pct=metricas["dist_ema20_pct"],
                 rsi_4h=metricas["rsi"],
+                analisis=analisis["analisis"],
+                nivel_atencion=analisis["nivel_atencion"],
+                alertas=analisis["alertas"],
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Error en notificar_scanner_match para %s: %s", par, exc)
-
-        try:
-            notifier.notificar_decision(
-                par=par,
-                senal="LONG",
-                evaluacion=decision["evaluacion_senal"],
-                multiplicador=decision["multiplicador_riesgo"],
-                conviccion=decision["conviccion"],
-                racional=decision["racional"],
-                alertas=decision["alertas"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Error en notificar_decision para %s: %s", par, exc)
+            log.warning("Error en notificar_scanner para %s: %s", par, exc)
 
 
 def run(escanear_ahora: bool = False) -> None:

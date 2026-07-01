@@ -149,23 +149,31 @@ def notificar_trade_cerrado(
     )
 
 
-def notificar_scanner_match(
+def notificar_scanner(
     par: str,
     precio: float,
     ema20: float,
     dist_ema20_pct: float,
     rsi_4h: float,
+    analisis: str,
+    nivel_atencion: str,
+    alertas: list[str],
 ) -> None:
-    """Cuando el scanner detecta un activo que cumple la condición 4H + tendencia alcista 1D/1W."""
+    """Mensaje único con la alerta del scanner y el contexto del cerebro."""
     signo = "+" if dist_ema20_pct >= 0 else ""
+    niveles = {"alto": "Alto", "medio": "Medio", "bajo": "Bajo"}
+    nivel_str = niveles.get(nivel_atencion, nivel_atencion)
+    alertas_str = "\n".join(f"  · {a}" for a in alertas) if alertas else "  · Ninguna"
+
     _enviar(
-        f"<b>Scanner 4H — setup detectado</b>\n"
-        f"Activo: <code>{par}</code>\n"
-        f"Precio: <code>{precio:,.4f}</code>\n"
-        f"EMA20 (4H): <code>{ema20:,.4f}</code>  ({signo}{dist_ema20_pct:.2f}%)\n"
-        f"RSI 4H: <code>{rsi_4h:.1f}</code> — sobreventa\n"
-        f"Tendencia 1D y 1W: alcista\n"
-        f"<i>Consultando al cerebro...</i>"
+        f"<b>Setup LONG — {par}</b>\n"
+        f"Precio:    <code>{precio:,.4f}</code>\n"
+        f"EMA20 4H:  <code>{ema20:,.4f}</code>  ({signo}{dist_ema20_pct:.2f}%)\n"
+        f"RSI 4H:    <code>{rsi_4h:.1f}</code> — sobreventa\n"
+        f"Tendencia: 1D alcista · 1W alcista\n\n"
+        f"<i>{analisis}</i>\n\n"
+        f"Nivel de atencion: <b>{nivel_str}</b>\n"
+        f"Riesgos:\n{alertas_str}"
     )
 
 

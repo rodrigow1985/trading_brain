@@ -1,7 +1,7 @@
 # Estado del Proyecto — trading_brain
 
 > Documento de continuidad. Actualizar al final de cada sesión de trabajo.
-> Última actualización: 2026-06-20 (Telegram notifier implementado y checkpoint OK)
+> Última actualización: 2026-07-01 (Scanner 4H multi-activo implementado)
 
 ---
 
@@ -19,6 +19,7 @@
 | Fase 3 | Validación pasiva (harness + SQLite) | ✅ Completada — checkpoint OK (2 filas insertadas, is_fallback=0) |
 | Fase 4 | Loop paper end-to-end | ✅ Completada — checkpoint OK (validate_brain 2/2 con nuevos campos _prev) |
 | Fase 4+ | Notificaciones Telegram | ✅ Implementadas — notifier.py + integración en scheduler y paper_trader |
+| Fase 4+ | Scanner 4H multi-activo | ✅ Implementado — cripto + acciones, cerebro contextualiza sin vetar |
 | Fase 5 | Iteración del prompt y métricas | ⏳ Pendiente |
 
 ---
@@ -35,14 +36,18 @@ src/
 ├── paper_trader.py     ✅ Simulador de trades (+notificaciones trade abierto/cerrado)
 ├── scheduler.py        ✅ Loop paper por vela 1H (+notificaciones inicio/señal/decisión/fallback/vela)
 ├── logger.py           ✅ Persistencia SQLite (+log_paper_trade_open/close, +log_account_snapshot)
-└── notifier.py         ✅ Notificaciones Telegram (stdlib pura, silencioso si no hay config)
+├── notifier.py         ✅ Notificaciones Telegram (stdlib pura, silencioso si no hay config)
+├── scanner.py          ✅ Scanner 4H multi-activo (cripto + acciones, pre-filtro + cerebro contextualiza)
+└── watchlist.py        ✅ Lista editable de activos a escanear
 
 scripts/
 ├── hello.py              ✅ Checkpoint Fase 0
 ├── fase1_checkpoint.py   ✅ Checkpoint Fase 1
 ├── fase2_checkpoint.py   ✅ Checkpoint Fase 2
 ├── validate_brain.py     ✅ Harness validación pasiva Fase 3
-└── run_scheduler.py      ✅ Entrypoint scheduler Fase 4
+├── run_scheduler.py      ✅ Entrypoint scheduler Fase 4 (loop 1H, estrategia cruce EMAs)
+├── run_scanner.py        ✅ Entrypoint scanner 4H (loop 4H, estrategia EMA20 + RSI)
+└── consultar_cerebro.py  ✅ Consulta manual ad-hoc al cerebro
 ```
 
 ### Docker
@@ -116,9 +121,10 @@ _(ninguno pendiente)_
 
 ## Próximos pasos
 
-1. **Inmediato:** configurar el bot de Telegram correctamente — enviar `/start` al bot y verificar el `TELEGRAM_CHAT_ID` con `@userinfobot`. Luego arrancar el scheduler con `docker compose run --rm brain python scripts/run_scheduler.py`.
-2. **Desarrollador Fase 5:** análisis del log, persistencia del estado del paper trader en SQLite, mejora de la vela OHLCV (descarga directa de la vela cerrada).
-3. **Analista:** revisar los registros acumulados en `brain_calls` y `paper_trades`, auditar la coherencia de las decisiones vs señales y evaluar si el prompt necesita ajustes.
+1. **Inmediato:** `docker compose build && docker compose run --rm brain python scripts/run_scanner.py --ahora` para probar el scanner con la watchlist actual.
+2. **Noticias:** agregar noticias del activo al contexto del cerebro (`contextualizar()`) para enriquecer el análisis fundamental.
+3. **Persistencia scanner:** loguear los matches del scanner en SQLite para análisis posterior.
+4. **Fase 5:** análisis del log acumulado de `brain_calls` y `paper_trades`, calibración del prompt.
 
 ---
 
