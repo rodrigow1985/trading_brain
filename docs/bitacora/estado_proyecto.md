@@ -1,11 +1,11 @@
 # Estado del Proyecto — trading_brain
 
 > Documento de continuidad. Actualizar al final de cada sesión de trabajo.
-> Última actualización: 2026-07-01 (Scanner 4H multi-activo implementado)
+> Última actualización: 2026-07-03 (Scanner multi-estrategia + gráficos + fallback Groq→Gemini)
 
 ---
 
-## Fase actual: Fase 4 completada + notificaciones Telegram implementadas
+## Fase actual: Scanner 4H multi-estrategia en producción (rama feat/chart-image)
 
 ---
 
@@ -15,11 +15,12 @@
 |---|---|---|
 | Fase 0 | Scaffolding, .env, hello.py | ✅ Completada |
 | Fase 1 | Armador de contexto MTF (context_builder.py) | ✅ Completada |
-| Fase 2 | El cerebro (brain.py) | ✅ Completada — checkpoint OK (fallback/validación verificados; LLM real bloqueado por saldo) |
-| Fase 3 | Validación pasiva (harness + SQLite) | ✅ Completada — checkpoint OK (2 filas insertadas, is_fallback=0) |
-| Fase 4 | Loop paper end-to-end | ✅ Completada — checkpoint OK (validate_brain 2/2 con nuevos campos _prev) |
-| Fase 4+ | Notificaciones Telegram | ✅ Implementadas — notifier.py + integración en scheduler y paper_trader |
-| Fase 4+ | Scanner 4H multi-activo | ✅ Implementado — cripto + acciones, cerebro contextualiza sin vetar |
+| Fase 2 | El cerebro (brain.py) | ✅ Completada |
+| Fase 3 | Validación pasiva (harness + SQLite) | ✅ Completada |
+| Fase 4 | Loop paper end-to-end | ✅ Completada |
+| Fase 4+ | Notificaciones Telegram | ✅ Implementadas |
+| Fase 4+ | Scanner 4H multi-activo (estrategia única) | ✅ Implementado |
+| Fase 4+ | Scanner multi-estrategia + gráficos | ✅ Implementado — rama feat/chart-image |
 | Fase 5 | Iteración del prompt y métricas | ⏳ Pendiente |
 
 ---
@@ -29,24 +30,25 @@
 ### Código
 ```
 src/
-├── types.py            ✅ TypedDicts compartidos entre módulos (Fase 4: +ema_rapida_prev, +ema_lenta_prev)
-├── context_builder.py  ✅ Armador de contexto MTF (Fase 4: +prev EMAs, +señal base real)
-├── brain.py            ✅ Cerebro LLM (tool use, validación, fallback)
-├── strategy.py         ✅ Señal base: cruce EMA21/EMA50 en 1H + RSI
-├── paper_trader.py     ✅ Simulador de trades (+notificaciones trade abierto/cerrado)
-├── scheduler.py        ✅ Loop paper por vela 1H (+notificaciones inicio/señal/decisión/fallback/vela)
-├── logger.py           ✅ Persistencia SQLite (+log_paper_trade_open/close, +log_account_snapshot)
-├── notifier.py         ✅ Notificaciones Telegram (stdlib pura, silencioso si no hay config)
-├── scanner.py          ✅ Scanner 4H multi-activo (cripto + acciones, pre-filtro + cerebro contextualiza)
-└── watchlist.py        ✅ Lista editable de activos a escanear
+├── types.py            ✅ TypedDicts compartidos
+├── context_builder.py  ✅ Armador de contexto MTF
+├── brain.py            ✅ Cerebro LLM — analizar() + contextualizar(); fallback Groq→Gemini
+├── strategy.py         ✅ Señal base: cruce EMA21/EMA50 en 1H
+├── paper_trader.py     ✅ Simulador de trades
+├── scheduler.py        ✅ Loop paper por vela 1H
+├── logger.py           ✅ Persistencia SQLite
+├── notifier.py         ✅ Notificaciones Telegram (texto + foto sendPhoto)
+├── scanner.py          ✅ Scanner multi-estrategia (4 estrategias, 4H/1D, vol_ratio, chart)
+├── charting.py         ✅ Generación de PNG con mplfinance (velas + EMA20 + RSI)
+└── watchlist.py        ✅ Lista editable de activos (6 cripto + 11 acciones)
 
 scripts/
 ├── hello.py              ✅ Checkpoint Fase 0
 ├── fase1_checkpoint.py   ✅ Checkpoint Fase 1
 ├── fase2_checkpoint.py   ✅ Checkpoint Fase 2
 ├── validate_brain.py     ✅ Harness validación pasiva Fase 3
-├── run_scheduler.py      ✅ Entrypoint scheduler Fase 4 (loop 1H, estrategia cruce EMAs)
-├── run_scanner.py        ✅ Entrypoint scanner 4H (loop 4H, estrategia EMA20 + RSI)
+├── run_scheduler.py      ✅ Entrypoint scheduler Fase 4 (loop 1H, cruce EMAs)
+├── run_scanner.py        ✅ Entrypoint scanner 4H (loop 4H, multi-estrategia)
 └── consultar_cerebro.py  ✅ Consulta manual ad-hoc al cerebro
 ```
 
@@ -55,7 +57,7 @@ scripts/
 Dockerfile           ✅ python:3.11-slim, PYTHONPATH=/app, volumen /app/data
 docker-compose.yml   ✅ servicio brain + volumen ./data
 .dockerignore        ✅
-data/.gitkeep        ✅ directorio de persistencia SQLite (no commitear contenido)
+data/.gitkeep        ✅
 ```
 
 ### Documentación
@@ -68,24 +70,28 @@ docs/system_prompt.md                  ✅
 docs/log_schema.md                     ✅
 docs/paper_trader.md                   ✅
 docs/pares.md                          ✅
+docs/images/
+  └── imagen-ejemplo-robot.jpg         ✅ Referencia visual para formato de mensajes Telegram
 docs/bitacora/analista/
   ├── 2026-06-15_revision_consistencia_inicial.md  ✅
   ├── 2026-06-16_hueco_ema200_indicadores.md        ✅
   └── 2026-06-16_revision_fase2_brain.md            ✅
 docs/bitacora/desarrollador/
-  ├── 2026-06-15_fase1_context_builder.md          ✅
-  ├── 2026-06-16_fase2_brain.md                    ✅
-  ├── 2026-06-16_refactor_multi_provider.md        ✅
-  ├── 2026-06-16_fase3_logger_harness.md           ✅
-  └── 2026-06-20_telegram_notifier.md              ✅
+  ├── 2026-06-15_fase1_context_builder.md           ✅
+  ├── 2026-06-16_fase2_brain.md                     ✅
+  ├── 2026-06-16_refactor_multi_provider.md         ✅
+  ├── 2026-06-16_fase3_logger_harness.md            ✅
+  ├── 2026-06-20_telegram_notifier.md               ✅
+  ├── 2026-07-01_scanner_4h.md                      ✅
+  └── 2026-07-03_scanner_multi_estrategia_graficos.md ✅
 ```
 
 ### Configuración
 ```
 .env.example    ✅
-.env            ✅ (creado por el desarrollador en Fase 1 — NO commitear)
+.env            ✅ (NO commitear — LLM_PROVIDER=groq, fallback a Gemini)
 .gitignore      ✅
-requirements.txt ✅
+requirements.txt ✅ — mplfinance + requests agregados
 .claude/agents/
 ├── analista.md     ✅
 └── desarrollador.md ✅
@@ -99,32 +105,40 @@ requirements.txt ✅
 |---|---|---|
 | Dependencias | requirements.txt | CLAUDE.md |
 | Salida LLM | Tool use (no JSON mode) | docs/system_prompt.md |
-| multiplicador_riesgo | [0.0, 1.0] — 1.0 = riesgo base completo | docs/contrato_cerebro.md |
+| multiplicador_riesgo | [0.0, 1.0] | docs/contrato_cerebro.md |
 | Exchange | Binance | CLAUDE.md |
-| Mercado inicial | Spot | CLAUDE.md |
 | EMAs | 21 (rápida) / 50 (lenta) / 200 (solo 1D) | docs/indicadores.md |
 | Timeframes | Top-down: 4H → 1D → 1H | docs/indicadores.md |
-| Señal base | Cruce EMA21/EMA50 en 1H + RSI | docs/indicadores.md |
-| SIGNAL_CLOSE vs TIMEOUT | Dos exit_reason distintos; TIMEOUT se evalúa primero | docs/paper_trader.md |
-| fallback_reason valores | CONTEXTO_INVALIDO, API_ERROR, JSON_MALFORMADO, SCHEMA_INVALIDO, TOOL_NO_LLAMADO | docs/log_schema.md |
-| Modelo LLM | Variable ANTHROPIC_MODEL (default: claude-sonnet-4-6) | .env.example |
-| Cash mínimo paper | 5% de PAPER_INITIAL_BALANCE (calculado, no fijo) | docs/paper_trader.md |
-| Velas 1D para EMA200 | 250 descargadas / 200 válidas post-warmup | docs/indicadores.md |
+| Señal base scheduler | Cruce EMA21/EMA50 en 1H + RSI | docs/indicadores.md |
+| Scanner EMA20_TOQUE | Evaluado en 1D (no 4H) | bitacora 2026-07-03 |
+| Scanner umbral EMA20 | ±1% (bajado de 2% por ruido excesivo) | bitacora 2026-07-03 |
+| Cerebro en scanner | contextualizar() — no veta, solo complementa | bitacora 2026-07-01 |
+| LLM provider | Groq primario; fallback a Gemini si 429 | bitacora 2026-07-03 |
+| Modelo Gemini fallback | gemini-flash-lite-latest via REST directo (sin SDK) | bitacora 2026-07-03 |
+| Gráficos | mplfinance nightclouds, 80 velas, EMA20 + RSI subplot | bitacora 2026-07-03 |
+| Formato Telegram | Foto + caption con secciones Indicadores / Análisis IA | docs/images/imagen-ejemplo-robot.jpg |
 
 ---
 
-## Huecos de spec pendientes de documentar
+## Proveedor LLM activo
 
-_(ninguno pendiente)_
+```
+LLM_PROVIDER=groq
+LLM_MODEL=llama-3.3-70b-versatile
+# Fallback automático → Gemini REST (gemini-flash-lite-latest) si Groq devuelve 429
+# Gemini se llama vía REST directo (?key= query param), sin SDK
+# GEMINI_MODEL= vacío → usa gemini-flash-lite-latest (default en _modelo_gemini())
+```
 
 ---
 
 ## Próximos pasos
 
-1. **Inmediato:** `docker compose build && docker compose run --rm brain python scripts/run_scanner.py --ahora` para probar el scanner con la watchlist actual.
-2. **Noticias:** agregar noticias del activo al contexto del cerebro (`contextualizar()`) para enriquecer el análisis fundamental.
-3. **Persistencia scanner:** loguear los matches del scanner en SQLite para análisis posterior.
-4. **Fase 5:** análisis del log acumulado de `brain_calls` y `paper_trades`, calibración del prompt.
+1. **Foto en Telegram:** la primera foto falla (400) pero el fallback a texto funciona. Investigar causa raíz (puede ser rate limit de la primera request al bot).
+2. **Groq tokens:** se agotan en el primer escaneo del día. Considerar Dev Tier o reducir assets.
+3. **Log SQLite del scanner:** persistir matches en `brain_calls` o tabla nueva para análisis posterior.
+4. **Noticias:** agregar contexto fundamental al análisis del cerebro.
+5. **Merge feat/chart-image → main** cuando el formato esté validado en producción.
 
 ---
 
@@ -132,6 +146,7 @@ _(ninguno pendiente)_
 
 - El proyecto está en `C:\Users\rodri\Workspace\GitHub\trading_brain`
 - El usuario opera en Windows con PowerShell / Git Bash
-- Estilo de trading del usuario: análisis top-down 4H → 1D → 1H, EMAs 21 y 50 principalmente
+- Rama activa: `feat/chart-image` (pendiente merge a main)
 - Los agentes se invocan con `/agent:analista` o `/agent:desarrollador`
-- El flujo es: analista valida docs → desarrollador implementa → desarrollador escribe log → analista documenta huecos de spec
+- El scanner corre con `docker compose run --rm brain python scripts/run_scanner.py`
+- Para test inmediato: agregar `--ahora`

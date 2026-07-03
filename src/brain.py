@@ -9,7 +9,7 @@ devuelve una decisión estructurada validada.
 
 Proveedores soportados (LLM_PROVIDER en el entorno):
     anthropic  — Claude (default)
-    gemini     — Google Gemini via google-generativeai
+    gemini     — Google Gemini via REST directo (generativelanguage.googleapis.com)
     groq       — Groq via groq SDK (API compatible con OpenAI)
 
 Restricciones innegociables:
@@ -29,6 +29,7 @@ import os
 from datetime import datetime
 from typing import Any
 
+import requests as _req
 from dotenv import load_dotenv
 
 from src.types import ContextoMercado, DecisionCerebro
@@ -583,105 +584,110 @@ def _llamar_anthropic(user_message: str) -> dict | None:
     return None
 
 
-def _llamar_gemini(user_message: str) -> dict | None:
-    """
-    Llama a Gemini via google-genai SDK con function calling forzado.
-    Devuelve el input del tool como dict, o None si hubo error.
-    """
-    try:
-        from google import genai  # lazy: solo si LLM_PROVIDER=gemini
-        from google.genai import types as genai_types
-    except ImportError:
-        logger.error(
-            "SDK google-genai no instalado. "
-            "Instalalo con: pip install google-genai>=1.0.0"
-        )
-        return None
+# ---------------------------------------------------------------------------
+# Gemini — REST directo (sin SDK)
+#
+# La key va como ?key= query param — el único método que funciona con claves
+# de Google AI Studio (formato AQ.… o AIzaSy…). No usar Authorization: Bearer
+# (eso es para Vertex AI / service accounts y da 401 con API keys).
+# Endpoint: generativelanguage.googleapis.com (no aiplatform.googleapis.com).
+# ---------------------------------------------------------------------------
 
-    api_key = os.environ.get("GEMINI_API_KEY")
+
+_GEMINI_JSON_SUFFIX_SCANNER = (
+    "\n\nRespondé ÚNICAMENTE con un objeto JSON con exactamente estos campos:\n"
+    '{"analisis": "<texto>", "nivel_atencion": "alto|medio|bajo", "alertas": ["<str>", ...]}\n'
+    "Sin texto adicional fuera del JSON."
+)
+
+_GEMINI_JSON_SUFFIX_CEREBRO = (
+    "\n\nRespondé ÚNICAMENTE con un objeto JSON con exactamente estos campos:\n"
+    '{"regimen": "tendencia_alcista|tendencia_bajista|rango|volatil", '
+    '"confianza_regimen": <0.0-1.0>, "evaluacion_senal": "confirmar|vetar|neutral", '
+    '"conviccion": <0.0-1.0>, "multiplicador_riesgo": <0.0-1.0>, '
+    '"factores_clave": ["<str>"], "racional": "<texto>", "alertas": ["<str>"]}\n'
+    "Sin texto adicional fuera del JSON."
+)
+
+
+def _gemini_rest_post(
+    system_prompt: str,
+    user_message: str,
+    json_suffix: str = "",
+    max_tokens: int = 2500,
+) -> dict | None:
+    """Llama a Gemini vía REST directo (key como ?key=, sin SDK) y devuelve dict o None.
+
+    No usa responseSchema (causa timeout en gemini-flash-latest). En su lugar combina
+    responseMimeType=application/json con instrucción de formato explícita en el prompt.
+    Reintentos automáticos ante 503 (high demand, error transitorio).
+    """
+    import time as _time
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        logger.error("GEMINI_API_KEY no definida en el entorno")
+        logger.error("GEMINI_API_KEY no definida")
         return None
 
-    model_name = _modelo_gemini()
-
-    logger.info("Proveedor: gemini | Modelo: %s", model_name)
-
-    tool_gemini = genai_types.Tool(
-        function_declarations=[
-            genai_types.FunctionDeclaration(
-                name="decision_cerebro",
-                description="Devuelve la evaluación del cerebro sobre la señal candidata.",
-                parameters=genai_types.Schema(
-                    type=genai_types.Type.OBJECT,
-                    properties={
-                        "regimen": genai_types.Schema(type=genai_types.Type.STRING),
-                        "confianza_regimen": genai_types.Schema(type=genai_types.Type.NUMBER),
-                        "evaluacion_senal": genai_types.Schema(type=genai_types.Type.STRING),
-                        "conviccion": genai_types.Schema(type=genai_types.Type.NUMBER),
-                        "multiplicador_riesgo": genai_types.Schema(type=genai_types.Type.NUMBER),
-                        "factores_clave": genai_types.Schema(
-                            type=genai_types.Type.ARRAY,
-                            items=genai_types.Schema(type=genai_types.Type.STRING),
-                        ),
-                        "racional": genai_types.Schema(type=genai_types.Type.STRING),
-                        "alertas": genai_types.Schema(
-                            type=genai_types.Type.ARRAY,
-                            items=genai_types.Schema(type=genai_types.Type.STRING),
-                        ),
-                    },
-                    required=[
-                        "regimen",
-                        "confianza_regimen",
-                        "evaluacion_senal",
-                        "conviccion",
-                        "multiplicador_riesgo",
-                        "factores_clave",
-                        "racional",
-                        "alertas",
-                    ],
-                ),
-            )
-        ]
+    model = _modelo_gemini()
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta"
+        f"/models/{model}:generateContent"
     )
-
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=user_message,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                temperature=_TEMPERATURE,
-                tools=[tool_gemini],
-                tool_config=genai_types.ToolConfig(
-                    function_calling_config=genai_types.FunctionCallingConfig(
-                        mode="ANY",
-                        allowed_function_names=["decision_cerebro"],
-                    )
-                ),
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Excepción llamando a Gemini: %s", exc)
+    full_system = system_prompt + json_suffix
+    body = {
+        "system_instruction": {"parts": [{"text": full_system}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.3,
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    resp = None
+    for intento in range(3):
+        try:
+            resp = _req.post(url, params={"key": api_key}, json=body, timeout=60)
+            if resp.status_code == 503:
+                wait = 10 * (intento + 1)
+                logger.warning(
+                    "Gemini 503 (high demand) — reintento %d/3 en %ds", intento + 1, wait
+                )
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            break
+        except _req.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response else 0
+            detail = exc.response.text[:600] if exc.response else str(exc)
+            logger.error("Error llamando a Gemini (scanner): %s %s", status, detail)
+            return None
+        except Exception as exc:
+            logger.error("Error llamando a Gemini (scanner): %s", exc)
+            return None
+    else:
+        logger.error("Gemini 503 persistente después de 3 intentos")
         return None
 
-    # Extraer el function_call de la respuesta
     try:
-        for part in response.candidates[0].content.parts:
-            if part.function_call is not None:
-                args = dict(part.function_call.args)
-                # Los arrays pueden venir como estructuras iterables — normalizar a list
-                for key, val in args.items():
-                    if hasattr(val, "__iter__") and not isinstance(val, str):
-                        args[key] = list(val)
-                logger.debug("Respuesta raw del tool (gemini): %s", args)
-                return args
-        logger.error("Gemini no devolvió function_call en la respuesta")
+        data = resp.json()
+        parts = data["candidates"][0]["content"]["parts"]
+        text = "".join(p.get("text", "") for p in parts)
+        return json.loads(text)
+    except Exception as exc:
+        logger.error("Error parseando respuesta de Gemini: %s", exc)
         return None
-    except (IndexError, AttributeError) as exc:
-        logger.error("Error extrayendo function_call de respuesta Gemini: %s", exc)
-        return None
+
+
+def _llamar_gemini(user_message: str) -> dict | None:
+    logger.info("Proveedor: gemini (REST) | Modelo: %s", _modelo_gemini())
+    return _gemini_rest_post(
+        system_prompt=_SYSTEM_PROMPT,
+        user_message=user_message,
+        json_suffix=_GEMINI_JSON_SUFFIX_CEREBRO,
+        max_tokens=3000,
+    )
 
 
 def _llamar_groq(user_message: str) -> dict | None:
@@ -861,75 +867,30 @@ def _llamar_groq_scanner(user_message: str) -> dict | None:
 
 
 def _modelo_gemini() -> str:
-    """Devuelve el modelo Gemini a usar, ignorando LLM_MODEL si no es un modelo Gemini."""
-    override = os.environ.get("LLM_MODEL", "")
-    return override if override.startswith("gemini") else "gemini-2.0-flash"
+    """Devuelve el modelo Gemini a usar.
+
+    Orden de prioridad:
+    1. GEMINI_MODEL (variable dedicada para el fallback/proveedor Gemini)
+    2. LLM_MODEL si empieza con "gemini-" (cuando LLM_PROVIDER=gemini)
+    3. Default: gemini-flash-lite-latest (alias al Flash Lite más reciente; menos demanda
+       que gemini-flash-latest, suficiente para análisis de scanner)
+    """
+    gemini_model = os.environ.get("GEMINI_MODEL", "").strip()
+    if gemini_model:
+        return gemini_model
+    llm_model = os.environ.get("LLM_MODEL", "").strip()
+    if llm_model.startswith("gemini"):
+        return llm_model
+    return "gemini-flash-lite-latest"
 
 
 def _llamar_gemini_scanner(user_message: str) -> dict | None:
-    try:
-        from google import genai
-        from google.genai import types as genai_types
-    except ImportError:
-        logger.error("SDK google-genai no instalado")
-        return None
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        logger.error("GEMINI_API_KEY no definida")
-        return None
-    model_name = _modelo_gemini()
-    tool_gemini = genai_types.Tool(
-        function_declarations=[
-            genai_types.FunctionDeclaration(
-                name="contexto_scanner",
-                description="Análisis contextual del setup detectado por el scanner.",
-                parameters=genai_types.Schema(
-                    type=genai_types.Type.OBJECT,
-                    properties={
-                        "analisis": genai_types.Schema(type=genai_types.Type.STRING),
-                        "nivel_atencion": genai_types.Schema(type=genai_types.Type.STRING),
-                        "alertas": genai_types.Schema(
-                            type=genai_types.Type.ARRAY,
-                            items=genai_types.Schema(type=genai_types.Type.STRING),
-                        ),
-                    },
-                    required=["analisis", "nivel_atencion", "alertas"],
-                ),
-            )
-        ]
+    logger.info("Proveedor: gemini (REST) | Modelo: %s", _modelo_gemini())
+    return _gemini_rest_post(
+        system_prompt=_SYSTEM_PROMPT_SCANNER,
+        user_message=user_message,
+        json_suffix=_GEMINI_JSON_SUFFIX_SCANNER,
     )
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=model_name,
-            contents=user_message,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT_SCANNER,
-                temperature=0.3,
-                tools=[tool_gemini],
-                tool_config=genai_types.ToolConfig(
-                    function_calling_config=genai_types.FunctionCallingConfig(
-                        mode="ANY",
-                        allowed_function_names=["contexto_scanner"],
-                    )
-                ),
-            ),
-        )
-    except Exception as exc:
-        logger.error("Error llamando a Gemini (scanner): %s", exc)
-        return None
-    try:
-        for part in response.candidates[0].content.parts:
-            if part.function_call is not None:
-                args = dict(part.function_call.args)
-                for key, val in args.items():
-                    if hasattr(val, "__iter__") and not isinstance(val, str):
-                        args[key] = list(val)
-                return args
-        return None
-    except Exception as exc:
-        logger.error("Error extrayendo function_call de Gemini (scanner): %s", exc)
-        return None
 
 
 def _llamar_proveedor_scanner(user_message: str) -> dict | None:
