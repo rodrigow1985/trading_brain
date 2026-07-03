@@ -34,6 +34,7 @@ import ccxt
 import pandas as pd
 
 from src.brain import contextualizar
+from src.charting import generar_chart_png
 from src.types import ContextoMercado
 
 log = logging.getLogger(__name__)
@@ -492,6 +493,14 @@ def escanear(pares: list[str]) -> list[dict]:
                 contexto["senal_base"] = senal
                 analisis = contextualizar(contexto)
 
+                # Chart: usa el df del timeframe de la estrategia
+                df_chart = df_1d if tf == "1d" else df_4h
+                chart_png: "bytes | None" = None
+                try:
+                    chart_png = generar_chart_png(df_chart, par, tf)
+                except Exception as exc_chart:
+                    log.warning("%s — [%s] no se pudo generar chart: %s", par, est, exc_chart)
+
                 resultados.append({
                     "par":        par,
                     "estrategia": est,
@@ -499,6 +508,7 @@ def escanear(pares: list[str]) -> list[dict]:
                     "timeframe":  tf,
                     "metricas":   metricas,
                     "analisis":   analisis,
+                    "chart_png":  chart_png,
                 })
                 log.info(
                     "%s — [%s] agregado (nivel=%s)", par, est, analisis["nivel_atencion"]

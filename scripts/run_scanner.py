@@ -77,6 +77,7 @@ def _notificar_resultados(resultados: list[dict]) -> None:
                 nivel_atencion=r["analisis"]["nivel_atencion"],
                 alertas=r["analisis"]["alertas"],
                 timeframe=r["timeframe"],
+                chart_png=r.get("chart_png"),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Error en notificar_scanner para %s/%s: %s", r["par"], r["estrategia"], exc)

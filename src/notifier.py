@@ -33,12 +33,12 @@ def _fmt_ts(iso_timestamp: str) -> str:
 
 def _enviar(texto: str) -> None:
     """Envía mensaje HTML al chat configurado. Silencioso si no hay config."""
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_id:
         return
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        url     = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = json.dumps(
             {"chat_id": chat_id, "text": texto, "parse_mode": "HTML"}
         ).encode()
@@ -48,6 +48,32 @@ def _enviar(texto: str) -> None:
         urllib.request.urlopen(req, timeout=10)
     except Exception as exc:  # noqa: BLE001
         log.warning("Error enviando notificación Telegram: %s", exc)
+
+
+def _enviar_foto(imagen: bytes, caption: str) -> None:
+    """
+    Envía foto PNG con caption HTML via Telegram sendPhoto.
+
+    Si la foto falla, cae al mensaje de texto puro (_enviar).
+    Caption limitado a 1024 chars (límite de Telegram).
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        import requests as req_lib
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        resp = req_lib.post(
+            url,
+            data={"chat_id": chat_id, "parse_mode": "HTML", "caption": caption[:1024]},
+            files={"photo": ("chart.png", imagen, "image/png")},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Error enviando foto Telegram (%s) — fallback a texto", exc)
+        _enviar(caption)
 
 
 def notificar_inicio(par: str, balance_inicial: float) -> None:
@@ -182,60 +208,80 @@ def notificar_scanner(
     nivel_atencion: str,
     alertas: list[str],
     timeframe: str = "4h",
+    chart_png: "bytes | None" = None,
 ) -> None:
-    """Mensaje único con la alerta del scanner y el contexto del cerebro."""
+    """Mensaje único con la alerta del scanner y el contexto del cerebro.
+
+    Si se provee chart_png, envía la imagen con el texto como caption (sendPhoto).
+    Si no, envía solo texto (sendMessage).
+    """
     label    = _ESTRATEGIA_LABELS.get(estrategia, estrategia)
-    tf_label = timeframe.upper()
+    tf_label = {"4h": "4H", "1d": "Diario", "1w": "Semanal"}.get(timeframe, timeframe.upper())
 
+    # Mercado según tipo de activo
+    mercado = os.environ.get("CCXT_EXCHANGE", "binance").capitalize() if "/" in par else "Acciones"
+
+    # Título + tagline según señal
     if senal == "LONG":
-        titulo       = f"<b>📈 Setup LONG — {par} | {label}</b>"
-        tendencia_str = "Tendencia: 1D alcista · 1W alcista"
+        circulo = "🟢"
+        trend   = "📈 Alcista"
+        tagline = f"<i>Setup LONG validado · 1D y 1W alcistas · {tf_label}</i>"
     elif senal == "SHORT":
-        titulo       = f"<b>📉 Setup SHORT — {par} | {label}</b>"
-        tendencia_str = "Tendencia: 1D bajista · 1W bajista"
+        circulo = "🔴"
+        trend   = "📉 Bajista"
+        tagline = f"<i>Setup SHORT validado · 1D y 1W bajistas · {tf_label}</i>"
     else:
-        titulo       = f"<b>🔔 Alerta — {par} | {label}</b>"
-        tendencia_str = ""
+        circulo = "🟡"
+        trend   = "📊 Neutro"
+        tagline = f"<i>Alerta informativa · {tf_label}</i>"
 
-    precio    = metricas.get("precio", 0.0)
     rsi_val   = metricas.get("rsi", 0.0)
     ema20     = metricas.get("ema20")
     dist_pct  = metricas.get("dist_ema20_pct")
     vol_ratio = metricas.get("vol_ratio")
 
     lineas = [
-        titulo,
-        f"Precio:       <code>{precio:,.4f}</code>",
-        f"RSI {tf_label}:    <code>{_fmt_rsi(rsi_val)}</code>",
+        f"{circulo} {par} ({mercado}) — {label} {trend}",
+        tagline,
+        "",
+        "<b>Indicadores</b>",
+        f"RSI {tf_label}: {_fmt_rsi(rsi_val)}",
     ]
-
-    if vol_ratio is not None:
-        lineas.append(f"Volumen:      <code>{_fmt_vol(vol_ratio)}</code>")
 
     if ema20 is not None and dist_pct is not None:
         flecha = "↑" if dist_pct >= 0 else "↓"
         signo  = "+" if dist_pct >= 0 else ""
-        lineas.append(
-            f"EMA20 {tf_label}: <code>{ema20:,.4f}  ({flecha} {signo}{dist_pct:.2f}%)</code>"
-        )
+        lineas.append(f"EMA20: {ema20:,.4f} | Dist: {signo}{dist_pct:.2f}% {flecha}")
 
-    if tendencia_str:
-        lineas.append(tendencia_str)
+    if vol_ratio is not None:
+        lineas.append(f"Volumen: {_fmt_vol(vol_ratio)}")
 
+    # Sección análisis IA
+    analisis_icon = "📈" if senal == "LONG" else "📉" if senal == "SHORT" else "📊"
+    lineas += [
+        "",
+        "<b>Análisis IA</b>",
+        f"{analisis_icon} {par} | {mercado} | {tf_label}",
+        "",
+        f"<i>{analisis}</i>",
+    ]
+
+    # Nivel y riesgos
     nivel_icons = {"alto": "⚠️", "medio": "ℹ️", "bajo": "✅"}
     nivel_icon  = nivel_icons.get(nivel_atencion, "")
-    nivel_str   = nivel_atencion.capitalize()
-
     alertas_str = "\n".join(f"  · {a}" for a in alertas) if alertas else "  · Ninguna"
     lineas += [
         "",
-        f"<i>{analisis}</i>",
-        "",
-        f"{nivel_icon} Nivel: <b>{nivel_str}</b>",
+        f"{nivel_icon} Nivel: <b>{nivel_atencion.capitalize()}</b>",
         f"Riesgos:\n{alertas_str}",
     ]
 
-    _enviar("\n".join(lineas))
+    texto = "\n".join(lineas)
+
+    if chart_png:
+        _enviar_foto(chart_png, texto)
+    else:
+        _enviar(texto)
 
 
 def notificar_fallback(par: str, razon: str) -> None:

@@ -48,6 +48,10 @@ _TOOL_CHOICE: dict[str, str] = {"type": "tool", "name": "decision_cerebro"}
 _REGIMENES_VALIDOS = {"tendencia_alcista", "tendencia_bajista", "rango", "volatil"}
 _EVALUACIONES_VALIDAS = {"confirmar", "vetar", "neutral"}
 
+class _RateLimitError(Exception):
+    """Señal interna: el proveedor activo alcanzó su límite de tokens/requests."""
+
+
 _FALLBACK: DecisionCerebro = {
     "regimen": "rango",
     "confianza_regimen": 0.0,
@@ -599,7 +603,7 @@ def _llamar_gemini(user_message: str) -> dict | None:
         logger.error("GEMINI_API_KEY no definida en el entorno")
         return None
 
-    model_name = os.environ.get("LLM_MODEL") or "gemini-1.5-flash"
+    model_name = _modelo_gemini()
 
     logger.info("Proveedor: gemini | Modelo: %s", model_name)
 
@@ -717,6 +721,9 @@ def _llamar_groq(user_message: str) -> dict | None:
             max_tokens=_MAX_TOKENS,
         )
     except Exception as exc:  # noqa: BLE001
+        if _es_rate_limit(exc):
+            logger.warning("Groq rate limit alcanzado: %s", exc)
+            raise _RateLimitError(str(exc)) from exc
         logger.error("Excepción llamando a Groq: %s", exc)
         return None
 
@@ -744,9 +751,8 @@ def _llamar_groq(user_message: str) -> dict | None:
 
 def _llamar_proveedor(user_message: str) -> dict | None:
     """
-    Llama al proveedor LLM configurado y devuelve el input del tool como dict.
-    Lee LLM_PROVIDER del entorno (anthropic | gemini | groq). Default: anthropic.
-    Devuelve None si hubo error de API o el tool no fue llamado.
+    Llama al proveedor LLM configurado. Si Groq alcanza el rate limit, cae
+    automáticamente a Gemini (si GEMINI_API_KEY está disponible).
     """
     provider = os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
 
@@ -755,7 +761,15 @@ def _llamar_proveedor(user_message: str) -> dict | None:
     elif provider == "gemini":
         return _llamar_gemini(user_message)
     elif provider == "groq":
-        return _llamar_groq(user_message)
+        try:
+            return _llamar_groq(user_message)
+        except _RateLimitError:
+            gemini_key = os.environ.get("GEMINI_API_KEY", "")
+            if not gemini_key:
+                logger.error("Groq rate limit — GEMINI_API_KEY no configurada, sin fallback")
+                return None
+            logger.warning("Groq rate limit — fallback a Gemini")
+            return _llamar_gemini(user_message)
     else:
         logger.error(
             "LLM_PROVIDER desconocido: '%s'. Valores válidos: anthropic, gemini, groq", provider
@@ -794,6 +808,17 @@ def _llamar_anthropic_scanner(user_message: str) -> dict | None:
     return None
 
 
+def _es_rate_limit(exc: Exception) -> bool:
+    """Detecta si una excepción es un error 429 de rate limit de Groq."""
+    exc_type = type(exc).__name__
+    exc_str  = str(exc)
+    return (
+        "RateLimitError" in exc_type
+        or "429" in exc_str
+        or "rate_limit_exceeded" in exc_str
+    )
+
+
 def _llamar_groq_scanner(user_message: str) -> dict | None:
     try:
         from groq import Groq
@@ -819,6 +844,9 @@ def _llamar_groq_scanner(user_message: str) -> dict | None:
             max_tokens=1024,
         )
     except Exception as exc:
+        if _es_rate_limit(exc):
+            logger.warning("Groq rate limit alcanzado (scanner): %s", exc)
+            raise _RateLimitError(str(exc)) from exc
         logger.error("Error llamando a Groq (scanner): %s", exc)
         return None
     try:
@@ -832,6 +860,12 @@ def _llamar_groq_scanner(user_message: str) -> dict | None:
         return None
 
 
+def _modelo_gemini() -> str:
+    """Devuelve el modelo Gemini a usar, ignorando LLM_MODEL si no es un modelo Gemini."""
+    override = os.environ.get("LLM_MODEL", "")
+    return override if override.startswith("gemini") else "gemini-2.0-flash"
+
+
 def _llamar_gemini_scanner(user_message: str) -> dict | None:
     try:
         from google import genai
@@ -843,7 +877,7 @@ def _llamar_gemini_scanner(user_message: str) -> dict | None:
     if not api_key:
         logger.error("GEMINI_API_KEY no definida")
         return None
-    model_name = os.environ.get("LLM_MODEL") or "gemini-2.0-flash"
+    model_name = _modelo_gemini()
     tool_gemini = genai_types.Tool(
         function_declarations=[
             genai_types.FunctionDeclaration(
@@ -899,13 +933,25 @@ def _llamar_gemini_scanner(user_message: str) -> dict | None:
 
 
 def _llamar_proveedor_scanner(user_message: str) -> dict | None:
+    """
+    Llama al proveedor configurado. Si Groq alcanza el rate limit, cae
+    automáticamente a Gemini (si GEMINI_API_KEY está disponible).
+    """
     provider = os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
     if provider == "anthropic":
         return _llamar_anthropic_scanner(user_message)
     elif provider == "gemini":
         return _llamar_gemini_scanner(user_message)
     elif provider == "groq":
-        return _llamar_groq_scanner(user_message)
+        try:
+            return _llamar_groq_scanner(user_message)
+        except _RateLimitError:
+            gemini_key = os.environ.get("GEMINI_API_KEY", "")
+            if not gemini_key:
+                logger.error("Groq rate limit — GEMINI_API_KEY no configurada, sin fallback")
+                return None
+            logger.warning("Groq rate limit — fallback a Gemini (scanner)")
+            return _llamar_gemini_scanner(user_message)
     else:
         logger.error("LLM_PROVIDER desconocido: '%s'", provider)
         return None
