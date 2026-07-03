@@ -149,32 +149,93 @@ def notificar_trade_cerrado(
     )
 
 
+_ESTRATEGIA_LABELS: dict[str, str] = {
+    "RSI_SOBREVENTA":       "RSI sobreventa",
+    "RSI_SOBRECOMPRA":      "RSI sobrecompra",
+    "EMA20_TOQUE":          "Toque EMA20",
+    "EMA20_RSI_SOBREVENTA": "EMA20 + RSI sobreventa",
+}
+
+
+def _fmt_rsi(rsi: float) -> str:
+    if rsi < 35:
+        return f"{rsi:.1f} ↓🔴"
+    if rsi > 70:
+        return f"{rsi:.1f} ↑🔴"
+    return f"{rsi:.1f}"
+
+
+def _fmt_vol(vol_ratio: float) -> str:
+    if vol_ratio > 1.5:
+        return f"{vol_ratio:.1f}× ↑📈"
+    if vol_ratio < 0.7:
+        return f"{vol_ratio:.1f}× ↓📉"
+    return f"{vol_ratio:.1f}×"
+
+
 def notificar_scanner(
     par: str,
-    precio: float,
-    ema20: float,
-    dist_ema20_pct: float,
-    rsi_4h: float,
+    senal: str,
+    estrategia: str,
+    metricas: dict,
     analisis: str,
     nivel_atencion: str,
     alertas: list[str],
+    timeframe: str = "4h",
 ) -> None:
     """Mensaje único con la alerta del scanner y el contexto del cerebro."""
-    signo = "+" if dist_ema20_pct >= 0 else ""
-    niveles = {"alto": "Alto", "medio": "Medio", "bajo": "Bajo"}
-    nivel_str = niveles.get(nivel_atencion, nivel_atencion)
-    alertas_str = "\n".join(f"  · {a}" for a in alertas) if alertas else "  · Ninguna"
+    label    = _ESTRATEGIA_LABELS.get(estrategia, estrategia)
+    tf_label = timeframe.upper()
 
-    _enviar(
-        f"<b>Setup LONG — {par}</b>\n"
-        f"Precio:    <code>{precio:,.4f}</code>\n"
-        f"EMA20 4H:  <code>{ema20:,.4f}</code>  ({signo}{dist_ema20_pct:.2f}%)\n"
-        f"RSI 4H:    <code>{rsi_4h:.1f}</code> — sobreventa\n"
-        f"Tendencia: 1D alcista · 1W alcista\n\n"
-        f"<i>{analisis}</i>\n\n"
-        f"Nivel de atencion: <b>{nivel_str}</b>\n"
-        f"Riesgos:\n{alertas_str}"
-    )
+    if senal == "LONG":
+        titulo       = f"<b>📈 Setup LONG — {par} | {label}</b>"
+        tendencia_str = "Tendencia: 1D alcista · 1W alcista"
+    elif senal == "SHORT":
+        titulo       = f"<b>📉 Setup SHORT — {par} | {label}</b>"
+        tendencia_str = "Tendencia: 1D bajista · 1W bajista"
+    else:
+        titulo       = f"<b>🔔 Alerta — {par} | {label}</b>"
+        tendencia_str = ""
+
+    precio    = metricas.get("precio", 0.0)
+    rsi_val   = metricas.get("rsi", 0.0)
+    ema20     = metricas.get("ema20")
+    dist_pct  = metricas.get("dist_ema20_pct")
+    vol_ratio = metricas.get("vol_ratio")
+
+    lineas = [
+        titulo,
+        f"Precio:       <code>{precio:,.4f}</code>",
+        f"RSI {tf_label}:    <code>{_fmt_rsi(rsi_val)}</code>",
+    ]
+
+    if vol_ratio is not None:
+        lineas.append(f"Volumen:      <code>{_fmt_vol(vol_ratio)}</code>")
+
+    if ema20 is not None and dist_pct is not None:
+        flecha = "↑" if dist_pct >= 0 else "↓"
+        signo  = "+" if dist_pct >= 0 else ""
+        lineas.append(
+            f"EMA20 {tf_label}: <code>{ema20:,.4f}  ({flecha} {signo}{dist_pct:.2f}%)</code>"
+        )
+
+    if tendencia_str:
+        lineas.append(tendencia_str)
+
+    nivel_icons = {"alto": "⚠️", "medio": "ℹ️", "bajo": "✅"}
+    nivel_icon  = nivel_icons.get(nivel_atencion, "")
+    nivel_str   = nivel_atencion.capitalize()
+
+    alertas_str = "\n".join(f"  · {a}" for a in alertas) if alertas else "  · Ninguna"
+    lineas += [
+        "",
+        f"<i>{analisis}</i>",
+        "",
+        f"{nivel_icon} Nivel: <b>{nivel_str}</b>",
+        f"Riesgos:\n{alertas_str}",
+    ]
+
+    _enviar("\n".join(lineas))
 
 
 def notificar_fallback(par: str, razon: str) -> None:

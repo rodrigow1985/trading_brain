@@ -1,25 +1,26 @@
 """
 Scanner 4H — Fase 4+.
 
-Escanea múltiples activos (cripto + acciones) buscando setups de entrada LONG:
+Escanea múltiples activos (cripto + acciones) evaluando condiciones técnicas
+en el timeframe 4H. Soporta cuatro estrategias configurables via .env:
 
-  Condición en 4H (trigger):
-    - Precio dentro del ±2% de la EMA20
-    - RSI < 35 (sobreventa)
+  SCANNER_RSI_SOBREVENTA       — RSI < umbral          → alerta informativa (NONE)
+  SCANNER_RSI_SOBRECOMPRA      — RSI > umbral          → alerta informativa (NONE)
+  SCANNER_EMA20_TOQUE          — precio ± dist% EMA20  → alerta informativa (NONE)
+  SCANNER_EMA20_RSI_SOBREVENTA — EMA20 toque + RSI sob → señal LONG (con filtro 1D/1W)
 
-  Pre-filtro de tendencia (solo pasa si AMBOS son alcistas):
-    - 1D alcista: close > EMA50 diario
-    - 1W alcista: close > EMA20 semanal
+Alertas (senal_base=NONE): notifican siempre que la condición se cumpla en 4H,
+sin filtro de tendencia. El cerebro analiza qué significa sin imponer dirección.
 
-  Si pasa el pre-filtro → llama al cerebro con contexto MTF completo.
-  El cerebro confirma solo si la tendencia macro (1W + 1D) respalda la entrada.
+Señales (senal_base=LONG): requieren 1D y 1W alcistas. El cerebro contextualiza
+con sesgo alcista.
 
-Tipos de activos soportados:
-  - Cripto: "BTC/USDT" (descarga via ccxt/Binance)
-  - Acciones: "AAPL" (descarga via yfinance/Yahoo Finance)
+Tipos de activos:
+  - Cripto: "BTC/USDT" (ccxt/Binance)
+  - Acciones: "AAPL" (yfinance/Yahoo Finance)
 
 Restricciones:
-  - NO importa anthropic directamente — usa brain.analizar()
+  - NO importa anthropic directamente — usa brain.contextualizar()
   - Logging con módulo estándar logging, no print
   - Type hints en todas las funciones públicas
 """
@@ -38,24 +39,75 @@ from src.types import ContextoMercado
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Parámetros de la estrategia
+# Configuración de estrategias
+# ---------------------------------------------------------------------------
+
+# Todas las estrategias disponibles (en orden de evaluación)
+_TODAS_ESTRATEGIAS: list[str] = [
+    "RSI_SOBREVENTA",
+    "RSI_SOBRECOMPRA",
+    "EMA20_TOQUE",
+    "EMA20_RSI_SOBREVENTA",
+]
+
+# Señal base por estrategia:
+#   NONE  → alerta informativa, sin filtro MTF, cerebro analiza sin dirección forzada
+#   LONG  → señal con filtro 1D/1W alcistas, cerebro enfoca perspectiva alcista
+_SENAL_BASE: dict[str, str] = {
+    "RSI_SOBREVENTA":       "NONE",
+    "RSI_SOBRECOMPRA":      "NONE",
+    "EMA20_TOQUE":          "NONE",
+    "EMA20_RSI_SOBREVENTA": "LONG",
+}
+
+# Timeframe de evaluación de cada estrategia
+_ESTRATEGIA_TF: dict[str, str] = {
+    "RSI_SOBREVENTA":       "4h",
+    "RSI_SOBRECOMPRA":      "4h",
+    "EMA20_TOQUE":          "1d",
+    "EMA20_RSI_SOBREVENTA": "4h",
+}
+
+# ---------------------------------------------------------------------------
+# Parámetros de indicadores
 # ---------------------------------------------------------------------------
 
 EMA20_PERIODO = 20
 EMA50_PERIODO = 50
-RSI_PERIODO = 14
-UMBRAL_DIST_EMA20_PCT = 0.02   # precio dentro del ±2% de la EMA20
-UMBRAL_RSI_SOBREVENTA = 35.0
+RSI_PERIODO   = 14
 
-# Velas a descargar por timeframe
-N_VELAS_4H = 200
-N_VELAS_1D = 300
-N_VELAS_1H = 200
-N_VELAS_1W = 104  # ~2 años de datos semanales
+N_VELAS_4H  = 200
+N_VELAS_1D  = 300
+N_VELAS_1H  = 200
+N_VELAS_1W  = 104
 VELAS_WARMUP = 50
 
-VENTANA_ESTRUCTURA = 20
+VENTANA_ESTRUCTURA  = 20
 N_PUNTOS_ESTRUCTURA = 5
+
+
+# ---------------------------------------------------------------------------
+# Helpers de entorno
+# ---------------------------------------------------------------------------
+
+def _estrategias_activas() -> list[str]:
+    """Lee las estrategias habilitadas en el entorno (SCANNER_<NOMBRE>=true)."""
+    return [
+        e for e in _TODAS_ESTRATEGIAS
+        if os.environ.get(f"SCANNER_{e}", "false").lower() == "true"
+    ]
+
+
+def _umbral_rsi_sobreventa() -> float:
+    return float(os.environ.get("SCANNER_RSI_SOBREVENTA_UMBRAL", "35"))
+
+
+def _umbral_rsi_sobrecompra() -> float:
+    return float(os.environ.get("SCANNER_RSI_SOBRECOMPRA_UMBRAL", "70"))
+
+
+def _umbral_dist_ema20() -> float:
+    return float(os.environ.get("SCANNER_EMA20_DISTANCIA_PCT", "2")) / 100
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +120,7 @@ def _es_accion(par: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Indicadores (pandas puro — sin pandas-ta)
+# Indicadores (pandas puro)
 # ---------------------------------------------------------------------------
 
 def _ema(series: pd.Series, period: int) -> pd.Series:
@@ -113,33 +165,22 @@ def _crear_exchange() -> ccxt.Exchange:
 
 
 def _descargar_crypto(par: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """Descarga OHLCV de Binance para un par cripto."""
     exchange = _crear_exchange()
     raw = exchange.fetch_ohlcv(par, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
-    return df
+    return df.set_index("timestamp")
 
 
 def _descargar_accion(ticker: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """
-    Descarga OHLCV de Yahoo Finance para una acción.
-
-    Timeframes soportados: "1h", "4h" (resampleado desde 1h), "1d", "1w".
-    El parámetro `limit` se ignora — yfinance usa period fijo.
-    """
     try:
         import yfinance as yf
     except ImportError:
-        raise ImportError(
-            "yfinance no instalado. Instalalo con: pip install yfinance>=0.2.0"
-        )
+        raise ImportError("yfinance no instalado. Ejecutar: pip install yfinance>=0.2.0")
 
     t = yf.Ticker(ticker)
 
     if timeframe in ("1h", "4h"):
-        # yfinance soporta hasta 730 días para 1h
         df_raw = t.history(period="2y", interval="1h", auto_adjust=True)
     elif timeframe == "1d":
         df_raw = t.history(period="5y", interval="1d", auto_adjust=True)
@@ -151,18 +192,15 @@ def _descargar_accion(ticker: str, timeframe: str, limit: int) -> pd.DataFrame:
     if df_raw.empty:
         raise ValueError(f"yfinance no devolvió datos para {ticker} ({timeframe})")
 
-    # Normalizar a minúsculas y seleccionar columnas OHLCV
     df_raw.columns = [c.lower() for c in df_raw.columns]
     cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df_raw.columns]
     df = df_raw[cols].copy()
 
-    # Asegurar índice UTC
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     else:
         df.index = df.index.tz_convert("UTC")
 
-    # Resamplear 1H → 4H eliminando huecos por mercado cerrado
     if timeframe == "4h":
         df = (
             df.resample("4h")
@@ -175,58 +213,94 @@ def _descargar_accion(ticker: str, timeframe: str, limit: int) -> pd.DataFrame:
 
 
 def _descargar(par: str, timeframe: str, limit: int) -> pd.DataFrame:
-    """Despacha la descarga según el tipo de activo (cripto o acción)."""
     if _es_accion(par):
         return _descargar_accion(par, timeframe, limit)
     return _descargar_crypto(par, timeframe, limit)
 
 
+def _aplicar_warmup(df: pd.DataFrame) -> pd.DataFrame:
+    return df.iloc[VELAS_WARMUP:] if len(df) > VELAS_WARMUP else df
+
+
 # ---------------------------------------------------------------------------
-# Condición del scanner en 4H
+# Evaluación de condiciones por estrategia
 # ---------------------------------------------------------------------------
 
-def _evaluar_condicion_4h(df: pd.DataFrame) -> tuple[bool, dict]:
+def _evaluar_estrategia(df_valid: pd.DataFrame, estrategia_id: str) -> tuple[bool, dict]:
     """
-    Verifica la condición de entrada en el timeframe 4H:
-      - Precio dentro del ±2% de la EMA20
-      - RSI < 35
-
-    Args:
-        df: DataFrame con warmup ya aplicado.
+    Evalúa si la última vela del df cumple la condición de la estrategia.
 
     Returns:
-        (cumple, metricas) donde metricas tiene precio, ema20, dist_ema20_pct, rsi.
+        (cumple, metricas) donde metricas incluye precio, rsi, ema20, dist_ema20_pct, vol_ratio.
     """
-    close = df["close"]
-    ema20 = _ema(close, EMA20_PERIODO)
-    rsi = _rsi(close, RSI_PERIODO)
+    close     = df_valid["close"]
+    precio    = float(close.iloc[-1])
+    rsi_val   = float(_rsi(close, RSI_PERIODO).iloc[-1])
+    ema20_val = float(_ema(close, EMA20_PERIODO).iloc[-1])
+    dist_pct  = (precio - ema20_val) / ema20_val
 
-    precio = float(close.iloc[-1])
-    ema20_val = float(ema20.iloc[-1])
-    rsi_val = float(rsi.iloc[-1])
+    vol_actual = float(df_valid["volume"].iloc[-1]) if "volume" in df_valid.columns else 0.0
+    vol_prom_s = _sma(df_valid["volume"], 20) if "volume" in df_valid.columns else pd.Series([1.0])
+    vol_prom   = float(vol_prom_s.iloc[-1]) if not vol_prom_s.empty else 1.0
+    vol_ratio  = vol_actual / vol_prom if vol_prom > 0 else 1.0
 
-    dist_pct = (precio - ema20_val) / ema20_val  # positivo = sobre EMA, negativo = bajo
-
-    cumple = abs(dist_pct) <= UMBRAL_DIST_EMA20_PCT and rsi_val < UMBRAL_RSI_SOBREVENTA
-
-    return cumple, {
-        "precio": precio,
-        "ema20": ema20_val,
+    metricas = {
+        "precio":         precio,
+        "rsi":            rsi_val,
+        "ema20":          ema20_val,
         "dist_ema20_pct": dist_pct * 100,
-        "rsi": rsi_val,
+        "vol_ratio":      vol_ratio,
     }
 
+    if estrategia_id == "RSI_SOBREVENTA":
+        return rsi_val < _umbral_rsi_sobreventa(), metricas
+
+    elif estrategia_id == "RSI_SOBRECOMPRA":
+        return rsi_val > _umbral_rsi_sobrecompra(), metricas
+
+    elif estrategia_id == "EMA20_TOQUE":
+        return abs(dist_pct) <= _umbral_dist_ema20(), metricas
+
+    elif estrategia_id == "EMA20_RSI_SOBREVENTA":
+        cumple = abs(dist_pct) <= _umbral_dist_ema20() and rsi_val < _umbral_rsi_sobreventa()
+        return cumple, metricas
+
+    else:
+        log.warning("Estrategia desconocida: %s", estrategia_id)
+        return False, metricas
+
+
+# ---------------------------------------------------------------------------
+# Filtro de tendencia MTF
+# ---------------------------------------------------------------------------
 
 def _tendencia_alcista_1d(df: pd.DataFrame) -> bool:
-    """1D alcista: close por encima de la EMA50 diaria."""
-    ema50 = _ema(df["close"], EMA50_PERIODO)
-    return float(df["close"].iloc[-1]) > float(ema50.iloc[-1])
+    return float(df["close"].iloc[-1]) > float(_ema(df["close"], EMA50_PERIODO).iloc[-1])
 
 
 def _tendencia_alcista_1w(df: pd.DataFrame) -> bool:
-    """1W alcista: close por encima de la EMA20 semanal."""
-    ema20 = _ema(df["close"], EMA20_PERIODO)
-    return float(df["close"].iloc[-1]) > float(ema20.iloc[-1])
+    return float(df["close"].iloc[-1]) > float(_ema(df["close"], EMA20_PERIODO).iloc[-1])
+
+
+def _tendencia_bajista_1d(df: pd.DataFrame) -> bool:
+    return float(df["close"].iloc[-1]) < float(_ema(df["close"], EMA50_PERIODO).iloc[-1])
+
+
+def _tendencia_bajista_1w(df: pd.DataFrame) -> bool:
+    return float(df["close"].iloc[-1]) < float(_ema(df["close"], EMA20_PERIODO).iloc[-1])
+
+
+def _pasa_filtro_tendencia(df_1d: pd.DataFrame, df_1w: pd.DataFrame, senal: str) -> bool:
+    """
+    NONE → sin filtro (alerta siempre pasa)
+    LONG → 1D alcista + 1W alcista
+    SHORT → 1D bajista + 1W bajista
+    """
+    if senal == "LONG":
+        return _tendencia_alcista_1d(df_1d) and _tendencia_alcista_1w(df_1w)
+    if senal == "SHORT":
+        return _tendencia_bajista_1d(df_1d) and _tendencia_bajista_1w(df_1w)
+    return True  # NONE: alerta informativa, sin filtro MTF
 
 
 # ---------------------------------------------------------------------------
@@ -234,51 +308,44 @@ def _tendencia_alcista_1w(df: pd.DataFrame) -> bool:
 # ---------------------------------------------------------------------------
 
 def _construir_tf_ctx(df: pd.DataFrame, es_diario: bool = False) -> dict:
-    """
-    Construye el sub-dict {indicadores, estructura} para un timeframe.
-    El df recibido ya debe tener el warmup aplicado.
-    """
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
+    close  = df["close"]
+    high   = df["high"]
+    low    = df["low"]
     volume = df["volume"]
 
-    rsi_s = _rsi(close, RSI_PERIODO)
-    ema21_s = _ema(close, 21)
-    ema50_s = _ema(close, 50)
-    atr_s = _atr(high, low, close)
-    vol_prom_s = _sma(volume, 20)
+    rsi_s    = _rsi(close, RSI_PERIODO)
+    ema21_s  = _ema(close, 21)
+    ema50_s  = _ema(close, 50)
+    atr_s    = _atr(high, low, close)
+    vol_prom = _sma(volume, 20)
 
     indicadores: dict = {
-        "rsi": float(rsi_s.iloc[-1]),
-        "ema_rapida": float(ema21_s.iloc[-1]),
-        "ema_lenta": float(ema50_s.iloc[-1]),
-        "ema_rapida_prev": float(ema21_s.iloc[-2]),
-        "ema_lenta_prev": float(ema50_s.iloc[-2]),
-        "atr": max(float(atr_s.iloc[-1]), 1e-8),  # ATR > 0 requerido por la validación
-        "volumen": float(volume.iloc[-1]),
-        "volumen_promedio": max(float(vol_prom_s.iloc[-1]), 1e-8),
+        "rsi":              float(rsi_s.iloc[-1]),
+        "ema_rapida":       float(ema21_s.iloc[-1]),
+        "ema_lenta":        float(ema50_s.iloc[-1]),
+        "ema_rapida_prev":  float(ema21_s.iloc[-2]),
+        "ema_lenta_prev":   float(ema50_s.iloc[-2]),
+        "atr":              max(float(atr_s.iloc[-1]), 1e-8),
+        "volumen":          float(volume.iloc[-1]),
+        "volumen_promedio": max(float(vol_prom.iloc[-1]), 1e-8),
     }
 
     if es_diario:
-        ema200_s = _ema(close, 200)
-        indicadores["ema_largo"] = float(ema200_s.iloc[-1])
+        indicadores["ema_largo"] = float(_ema(close, 200).iloc[-1])
 
-    # Estructura
     rolling_max = close.rolling(VENTANA_ESTRUCTURA).max()
     rolling_min = close.rolling(VENTANA_ESTRUCTURA).min()
     maximos = rolling_max.dropna().iloc[-N_PUNTOS_ESTRUCTURA:].tolist()
     minimos = rolling_min.dropna().iloc[-N_PUNTOS_ESTRUCTURA:].tolist()
 
-    # Rellenar hasta 5 puntos si hay pocos datos
     while len(maximos) < N_PUNTOS_ESTRUCTURA:
         maximos.insert(0, maximos[0] if maximos else float(close.iloc[0]))
     while len(minimos) < N_PUNTOS_ESTRUCTURA:
         minimos.insert(0, minimos[0] if minimos else float(close.iloc[0]))
 
     precio = float(close.iloc[-1])
-    ema21 = indicadores["ema_rapida"]
-    ema50 = indicadores["ema_lenta"]
+    ema21  = indicadores["ema_rapida"]
+    ema50  = indicadores["ema_lenta"]
 
     if precio > ema21 > ema50:
         tendencia = "alcista"
@@ -287,19 +354,15 @@ def _construir_tf_ctx(df: pd.DataFrame, es_diario: bool = False) -> dict:
     else:
         tendencia = "lateral"
 
-    estructura = {
-        "precio_actual": precio,
-        "maximos_recientes": [float(v) for v in maximos[:N_PUNTOS_ESTRUCTURA]],
-        "minimos_recientes": [float(v) for v in minimos[:N_PUNTOS_ESTRUCTURA]],
-        "tendencia": tendencia,
+    return {
+        "indicadores": indicadores,
+        "estructura": {
+            "precio_actual":    precio,
+            "maximos_recientes": [float(v) for v in maximos[:N_PUNTOS_ESTRUCTURA]],
+            "minimos_recientes": [float(v) for v in minimos[:N_PUNTOS_ESTRUCTURA]],
+            "tendencia":        tendencia,
+        },
     }
-
-    return {"indicadores": indicadores, "estructura": estructura}
-
-
-def _aplicar_warmup(df: pd.DataFrame) -> pd.DataFrame:
-    """Descarta las primeras VELAS_WARMUP filas para estabilizar los indicadores."""
-    return df.iloc[VELAS_WARMUP:] if len(df) > VELAS_WARMUP else df
 
 
 def _construir_contexto_par(
@@ -309,39 +372,28 @@ def _construir_contexto_par(
     df_1h: pd.DataFrame,
     df_1w: Optional[pd.DataFrame] = None,
 ) -> ContextoMercado:
-    """
-    Construye el ContextoMercado completo para pasarle al cerebro.
-    Todos los DataFrames recibidos son SIN warmup — se aplica aquí.
-    """
     ctx_4h = _construir_tf_ctx(_aplicar_warmup(df_4h))
     ctx_1d = _construir_tf_ctx(_aplicar_warmup(df_1d), es_diario=True)
     ctx_1h = _construir_tf_ctx(_aplicar_warmup(df_1h))
 
-    # Timestamp de la última vela 1H
     ultimo_ts = df_1h.index[-1]
     if ultimo_ts.tzinfo is None:
         ultimo_ts = ultimo_ts.replace(tzinfo=timezone.utc)
-    timestamp_iso = ultimo_ts.isoformat()
 
-    timeframes: dict = {
-        "4h": ctx_4h,
-        "1d": ctx_1d,
-        "1h": ctx_1h,
-    }
+    timeframes: dict = {"4h": ctx_4h, "1d": ctx_1d, "1h": ctx_1h}
 
-    # 1W: se pasa como contexto adicional si está disponible
     if df_1w is not None:
         df_1w_valid = _aplicar_warmup(df_1w)
         if len(df_1w_valid) >= N_PUNTOS_ESTRUCTURA + 1:
             timeframes["1w"] = _construir_tf_ctx(df_1w_valid)
 
     return {
-        "par": par,
-        "timestamp": timestamp_iso,
+        "par":         par,
+        "timestamp":   ultimo_ts.isoformat(),
         "mercado_tipo": "spot",
-        "senal_base": "LONG",
+        "senal_base":  "NONE",  # se sobreescribe en escanear()
         "portfolio": {
-            "posicion_actual": "NONE",
+            "posicion_actual":      "NONE",
             "riesgo_disponible_pct": 1.0,
         },
         "timeframes": timeframes,
@@ -354,85 +406,109 @@ def _construir_contexto_par(
 
 def escanear(pares: list[str]) -> list[dict]:
     """
-    Escanea todos los activos y devuelve los que el cerebro confirma como LONG.
+    Escanea todos los activos con las estrategias habilitadas en .env.
 
     Flujo por activo:
-      1. Descarga 4H → verifica EMA20 ± 2% y RSI < 35
-      2. Descarga 1D → verifica tendencia alcista (close > EMA50)
-      3. Descarga 1W → verifica tendencia alcista (close > EMA20)
-      4. Si pasa el pre-filtro → construye contexto MTF + llama al cerebro
-      5. Si el cerebro confirma → incluye en resultados
-
-    Args:
-        pares: Lista de tickers (cripto "BTC/USDT" o acciones "AAPL").
+      1. Descarga 4H → evalúa estrategias 4H (RSI_SOBREVENTA, RSI_SOBRECOMPRA, EMA20_RSI_SOBREVENTA)
+      2. Descarga 1D → evalúa estrategias 1D (EMA20_TOQUE) + sirve para filtro MTF
+      3. Descarga 1W y 1H solo si algo pasó
+      4. Filtro MTF: alertas (NONE) siempre pasan; señales (LONG) requieren 1D + 1W alcistas
+      5. Llama al cerebro (contextualizar) y agrega al resultado
 
     Returns:
-        Lista de dicts con {par, metricas_4h, decision, contexto} para señales confirmadas.
+        Lista de dicts: {par, estrategia, senal, timeframe, metricas, analisis}
     """
+    activas = _estrategias_activas()
+    if not activas:
+        log.warning("No hay estrategias activas. Configurar SCANNER_* en .env")
+        return []
+
+    activas_4h = [e for e in activas if _ESTRATEGIA_TF[e] == "4h"]
+    activas_1d = [e for e in activas if _ESTRATEGIA_TF[e] == "1d"]
+
+    log.info("Estrategias activas: %s", ", ".join(activas))
     resultados: list[dict] = []
 
     for par in pares:
         log.info("Escaneando %s...", par)
         try:
-            # --- Paso 1: condición 4H ---
+            # --- Paso 1: 4H siempre (datos base + estrategias 4H) ---
             df_4h = _descargar(par, "4h", N_VELAS_4H)
-            cumple_4h, metricas = _evaluar_condicion_4h(_aplicar_warmup(df_4h))
+            df_4h_valid = _aplicar_warmup(df_4h)
 
-            if not cumple_4h:
-                log.debug(
-                    "%s — descartado 4H: precio=%.4f EMA20=%.4f dist=%.1f%% RSI=%.1f",
-                    par, metricas["precio"], metricas["ema20"],
-                    metricas["dist_ema20_pct"], metricas["rsi"],
-                )
+            pasaron: list[tuple[str, dict, str]] = []  # (estrategia, metricas, timeframe)
+
+            for est in activas_4h:
+                cumple, metricas = _evaluar_estrategia(df_4h_valid, est)
+                if cumple:
+                    log.info(
+                        "%s — PASA 4H [%s]: rsi=%.1f dist_ema20=%.2f%%",
+                        par, est, metricas["rsi"], metricas["dist_ema20_pct"],
+                    )
+                    pasaron.append((est, metricas, "4h"))
+                else:
+                    log.debug("%s — descartado 4H [%s]", par, est)
+
+            # --- Paso 2: 1D (para estrategias 1D y/o filtro MTF de señales 4H) ---
+            necesita_1d = bool(activas_1d) or bool(pasaron)
+            if not necesita_1d:
                 continue
 
-            log.info(
-                "%s — PASA 4H: dist EMA20=%.2f%% RSI=%.1f",
-                par, metricas["dist_ema20_pct"], metricas["rsi"],
-            )
-
-            # --- Paso 2: tendencia 1D ---
             df_1d = _descargar(par, "1d", N_VELAS_1D)
-            if not _tendencia_alcista_1d(_aplicar_warmup(df_1d)):
-                log.info("%s — descartado: 1D NO alcista (close < EMA50)", par)
+            df_1d_valid = _aplicar_warmup(df_1d)
+
+            for est in activas_1d:
+                cumple, metricas = _evaluar_estrategia(df_1d_valid, est)
+                if cumple:
+                    log.info(
+                        "%s — PASA 1D [%s]: rsi=%.1f dist_ema20=%.2f%%",
+                        par, est, metricas["rsi"], metricas["dist_ema20_pct"],
+                    )
+                    pasaron.append((est, metricas, "1d"))
+                else:
+                    log.debug("%s — descartado 1D [%s]", par, est)
+
+            if not pasaron:
                 continue
 
-            log.info("%s — PASA 1D: tendencia alcista", par)
-
-            # --- Paso 3: tendencia 1W ---
+            # --- Paso 3: 1W y 1H (solo si algo pasó) ---
             df_1w = _descargar(par, "1w", N_VELAS_1W)
-            df_1w_valid = _aplicar_warmup(df_1w)
-            if not _tendencia_alcista_1w(df_1w_valid):
-                log.info("%s — descartado: 1W NO alcista (close < EMA20)", par)
-                continue
-
-            log.info("%s — PASA 1W: tendencia alcista — solicitando contexto al cerebro...", par)
-
-            # --- Paso 4: contexto completo + contextualización ---
             df_1h = _descargar(par, "1h", N_VELAS_1H)
-            contexto = _construir_contexto_par(par, df_4h, df_1d, df_1h, df_1w)
-            analisis = contextualizar(contexto)
+            df_1w_valid = _aplicar_warmup(df_1w)
 
-            log.info(
-                "%s — Cerebro (contexto): nivel=%s | %s",
-                par, analisis["nivel_atencion"], analisis["analisis"][:80],
-            )
+            # --- Paso 4: filtro MTF + contextualización ---
+            for est, metricas, tf in pasaron:
+                senal = _SENAL_BASE[est]
 
-            # La estrategia ya pasó el pre-filtro — siempre se incluye en resultados
-            resultados.append({
-                "par": par,
-                "metricas_4h": metricas,
-                "analisis": analisis,
-                "contexto": contexto,
-            })
-            log.info("%s — agregado a resultados (nivel: %s)", par, analisis["nivel_atencion"])
+                if not _pasa_filtro_tendencia(df_1d_valid, df_1w_valid, senal):
+                    log.info(
+                        "%s — [%s] no pasa filtro tendencia MTF (senal=%s)", par, est, senal
+                    )
+                    continue
+
+                log.info("%s — [%s] pasa MTF — contextualizando con cerebro...", par, est)
+
+                contexto = _construir_contexto_par(par, df_4h, df_1d, df_1h, df_1w)
+                contexto["senal_base"] = senal
+                analisis = contextualizar(contexto)
+
+                resultados.append({
+                    "par":        par,
+                    "estrategia": est,
+                    "senal":      senal,
+                    "timeframe":  tf,
+                    "metricas":   metricas,
+                    "analisis":   analisis,
+                })
+                log.info(
+                    "%s — [%s] agregado (nivel=%s)", par, est, analisis["nivel_atencion"]
+                )
 
         except Exception as exc:  # noqa: BLE001
             log.error("Error escaneando %s: %s", par, exc, exc_info=True)
             continue
 
     log.info(
-        "Scanner completado: %d/%d activos confirmados por el cerebro",
-        len(resultados), len(pares),
+        "Scanner completado: %d alertas/señales en %d activos", len(resultados), len(pares)
     )
     return resultados

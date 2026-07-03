@@ -67,23 +67,19 @@ def _dormir_hasta(wait_seconds: float) -> None:
 
 def _notificar_resultados(resultados: list[dict]) -> None:
     for r in resultados:
-        par = r["par"]
-        metricas = r["metricas_4h"]
-        analisis = r["analisis"]
-
         try:
             notifier.notificar_scanner(
-                par=par,
-                precio=metricas["precio"],
-                ema20=metricas["ema20"],
-                dist_ema20_pct=metricas["dist_ema20_pct"],
-                rsi_4h=metricas["rsi"],
-                analisis=analisis["analisis"],
-                nivel_atencion=analisis["nivel_atencion"],
-                alertas=analisis["alertas"],
+                par=r["par"],
+                senal=r["senal"],
+                estrategia=r["estrategia"],
+                metricas=r["metricas"],
+                analisis=r["analisis"]["analisis"],
+                nivel_atencion=r["analisis"]["nivel_atencion"],
+                alertas=r["analisis"]["alertas"],
+                timeframe=r["timeframe"],
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Error en notificar_scanner para %s: %s", par, exc)
+            log.warning("Error en notificar_scanner para %s/%s: %s", r["par"], r["estrategia"], exc)
 
 
 def run(escanear_ahora: bool = False) -> None:
