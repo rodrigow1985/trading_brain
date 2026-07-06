@@ -1,13 +1,13 @@
 """
-Scanner 4H — entrypoint.
+Scanner 1D — entrypoint.
 
-Escanea múltiples activos al cierre de cada vela 4H y notifica a Telegram
-cuando el cerebro confirma una señal LONG.
+Escanea múltiples activos al cierre de la vela diaria (00:00 UTC) y notifica
+a Telegram cuando se detecta una condición técnica relevante.
 
 Uso:
     docker compose run --rm brain python scripts/run_scanner.py
 
-    # Escaneo inmediato sin esperar la vela (útil para pruebas)
+    # Escaneo inmediato sin esperar el cierre de vela (útil para pruebas)
     docker compose run --rm brain python scripts/run_scanner.py --ahora
 """
 
@@ -36,33 +36,22 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _tiempo_hasta_proximo_cierre_4h() -> float:
-    """Calcula segundos hasta el próximo cierre de vela 4H (00, 04, 08, 12, 16, 20 UTC)."""
+def _tiempo_hasta_cierre_1d() -> float:
+    """Calcula segundos hasta el próximo cierre de vela 1D (00:00 UTC)."""
     now = datetime.now(timezone.utc)
-    hora_actual = now.hour
-    # Siguiente múltiplo de 4 horas
-    proxima_hora = ((hora_actual // 4) + 1) * 4
-
-    if proxima_hora >= 24:
-        next_close = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-    else:
-        next_close = now.replace(
-            hour=proxima_hora, minute=0, second=0, microsecond=0
-        )
-
+    next_close = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
     return max(0.0, (next_close - now).total_seconds())
 
 
 def _dormir_hasta(wait_seconds: float) -> None:
     remaining = wait_seconds
-    log.info("Esperando %.0f segundos hasta el próximo cierre de vela 4H...", remaining)
+    proxima = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+    log.info("Esperando hasta el cierre de vela 1D — %s UTC", proxima.strftime("%Y-%m-%d 00:00"))
     while remaining > 0:
         time.sleep(min(60.0, remaining))
         remaining -= 60.0
         if remaining > 60:
-            log.debug("%.0f segundos restantes hasta el cierre de vela 4H", remaining)
+            log.debug("%.0f segundos hasta el cierre de vela 1D", remaining)
 
 
 def _notificar_resultados(resultados: list[dict]) -> None:
@@ -84,7 +73,7 @@ def _notificar_resultados(resultados: list[dict]) -> None:
 
 
 def run(escanear_ahora: bool = False) -> None:
-    log.info("=== Scanner 4H iniciado ===")
+    log.info("=== Scanner 1D iniciado — ejecuta al cierre de cada vela diaria (00:00 UTC) ===")
     log.info("Activos: %d — %s", len(PARES), ", ".join(PARES))
 
     ciclo = 0
@@ -93,7 +82,7 @@ def run(escanear_ahora: bool = False) -> None:
         ciclo += 1
 
         if not escanear_ahora or ciclo > 1:
-            wait_sec = _tiempo_hasta_proximo_cierre_4h()
+            wait_sec = _tiempo_hasta_cierre_1d()
             _dormir_hasta(wait_sec)
 
         log.info("[Ciclo %d] Iniciando escaneo de %d activos...", ciclo, len(PARES))
@@ -112,7 +101,7 @@ def run(escanear_ahora: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scanner 4H — escanea activos al cierre de cada vela.")
+    parser = argparse.ArgumentParser(description="Scanner 1D — escanea activos al cierre de cada vela diaria (00:00 UTC).")
     parser.add_argument(
         "--ahora",
         action="store_true",
