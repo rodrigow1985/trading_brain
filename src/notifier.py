@@ -284,6 +284,127 @@ def notificar_scanner(
         _enviar(texto)
 
 
+# Labels legibles para las claves de "detalle" de las situaciones v2
+_DETALLE_LABELS: dict[str, str] = {
+    "direccion":                       "Dirección",
+    "dist_actual_pct":                 "Distancia actual a EMA20",
+    "dist_cierre_pct":                 "Distancia del cierre a EMA20",
+    "con_volumen":                     "Con volumen sobre promedio",
+    "rsi":                             "RSI",
+    "suba_20_ruedas_pct":              "Suba en 20 ruedas",
+    "caida_20_ruedas_pct":             "Caída en 20 ruedas",
+    "velas_consecutivas_sobrecompra":  "Velas consecutivas en sobrecompra",
+    "velas_consecutivas_sobreventa":   "Velas consecutivas en sobreventa",
+    "tipo":                            "Tipo",
+    "maximo_previo":                   "Máximo previo",
+    "minimo_previo":                   "Mínimo previo",
+    "maximo_actual":                   "Máximo actual",
+    "minimo_actual":                   "Mínimo actual",
+    "rsi_previo":                      "RSI en pivote previo",
+    "rsi_actual":                      "RSI en pivote actual",
+    "mecha_pct_rango":                 "Mecha (% del rango)",
+    "ratio_volumen":                   "Volumen vs promedio",
+    "direccion_vela":                  "Dirección de la vela",
+    "en_zona":                         "Zona",
+    "ancho_bandas_pct":                "Ancho de bandas",
+    "dias_compresion":                 "Días de compresión",
+    "referencia_tecnica":              "Referencia técnica",
+    "gap_pct":                         "Gap",
+    "evolucion":                       "Evolución",
+}
+
+
+def _fmt_precio(valor: float) -> str:
+    """Precios: 2 decimales para valores grandes, 4 para chicos (altcoins)."""
+    return f"{valor:,.2f}" if abs(valor) >= 10 else f"{valor:,.4f}"
+
+
+def _fmt_detalle_valor(clave: str, valor) -> str:
+    if isinstance(valor, bool):
+        return "sí" if valor else "no"
+    if isinstance(valor, (int, float)):
+        if clave.endswith("_pct"):
+            return f"{valor:+.2f}%" if "dist" in clave or clave == "gap_pct" else f"{valor:.2f}%"
+        if clave == "ratio_volumen":
+            return f"{valor:.1f}×"
+        if isinstance(valor, int) or float(valor).is_integer():
+            return f"{int(valor)}"
+        return _fmt_precio(valor)
+    return str(valor)
+
+
+def notificar_situaciones(
+    par: str,
+    fecha_vela: str,
+    situaciones: list[dict],
+    activas_previas: list[str],
+    prioritaria: bool,
+    metricas: dict,
+    analisis: str,
+    nivel_atencion: str,
+    alertas: list[str],
+    chart_png: "bytes | None" = None,
+) -> None:
+    """
+    Mensaje único por ticker con las situaciones técnicas v2 detectadas.
+
+    situaciones: lista de {id, nombre, detalle} — solo las NUEVAS (anti-dup).
+    activas_previas: nombres de situaciones que siguen activas ya alertadas.
+    prioritaria: True si hubo confluencia de 2+ situaciones simultáneas.
+    """
+    mercado = os.environ.get("CCXT_EXCHANGE", "binance").capitalize() if "/" in par else "Acciones"
+    n = len(situaciones)
+    plural = "situaciones técnicas" if n != 1 else "situación técnica"
+
+    lineas = [f"🟡 <b>{par}</b> ({mercado}) — {n} {plural} — Diario"]
+    if prioritaria:
+        lineas.append("⭐ <b>PRIORITARIA — confluencia de situaciones</b>")
+    lineas.append(f"Fecha vela: {fecha_vela}")
+
+    for sit in situaciones:
+        lineas += ["", f"<b>{sit['nombre']}</b>"]
+        for clave, valor in sit.get("detalle", {}).items():
+            label = _DETALLE_LABELS.get(clave, clave.replace("_", " ").capitalize())
+            lineas.append(f"  · {label}: {_fmt_detalle_valor(clave, valor)}")
+
+    if activas_previas:
+        lineas += ["", "<i>Siguen activas (ya alertadas): " + ", ".join(activas_previas) + "</i>"]
+
+    cierre    = metricas.get("precio")
+    ema20     = metricas.get("ema20")
+    dist_pct  = metricas.get("dist_ema20_pct")
+    rsi_val   = metricas.get("rsi")
+    vol_ratio = metricas.get("vol_ratio")
+
+    lineas += ["", "<b>Contexto</b>"]
+    if cierre is not None and ema20 is not None and dist_pct is not None:
+        signo = "+" if dist_pct >= 0 else ""
+        lineas.append(
+            f"Cierre: {_fmt_precio(cierre)} | EMA20: {_fmt_precio(ema20)} ({signo}{dist_pct:.2f}%)"
+        )
+    if rsi_val is not None:
+        vol_str = f" | Volumen: {_fmt_vol(vol_ratio)}" if vol_ratio is not None else ""
+        lineas.append(f"RSI: {_fmt_rsi(rsi_val)}{vol_str}")
+
+    lineas += ["", "<b>Análisis IA</b>", f"<i>{analisis}</i>"]
+
+    nivel_icons = {"alto": "⚠️", "medio": "ℹ️", "bajo": "✅"}
+    nivel_icon  = nivel_icons.get(nivel_atencion, "")
+    alertas_str = "\n".join(f"  · {a}" for a in alertas) if alertas else "  · Ninguna"
+    lineas += [
+        "",
+        f"{nivel_icon} Nivel: <b>{nivel_atencion.capitalize()}</b>",
+        f"Riesgos:\n{alertas_str}",
+    ]
+
+    texto = "\n".join(lineas)
+
+    if chart_png:
+        _enviar_foto(chart_png, texto)
+    else:
+        _enviar(texto)
+
+
 def notificar_fallback(par: str, razon: str) -> None:
     """Cuando el cerebro activa el fallback."""
     _enviar(

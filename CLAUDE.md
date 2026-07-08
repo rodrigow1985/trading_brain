@@ -21,6 +21,9 @@ Antes de tocar cualquier módulo, leer el doc correspondiente:
 | [`docs/log_schema.md`](docs/log_schema.md) | Tablas SQLite, columnas, índices y consultas de referencia |
 | [`docs/paper_trader.md`](docs/paper_trader.md) | Reglas del simulador: sizing, stops, comisiones, slippage |
 | [`docs/pares.md`](docs/pares.md) | Tabla de tickers activos y en prueba |
+| [`docs/estrategias_v2.md`](docs/estrategias_v2.md) | Screener de situaciones técnicas 1D (set v2 del scanner) |
+
+**Versionado de estrategias del scanner:** los sets viven en `src/strategies/` (v1, v2) y se eligen con `SCANNER_STRATEGY_SET` en `.env` — rollback sin tocar código. El snapshot del set original está taggeado en git: `estrategias-v1`.
 
 ---
 

@@ -57,19 +57,35 @@ def _dormir_hasta(wait_seconds: float) -> None:
 def _notificar_resultados(resultados: list[dict]) -> None:
     for r in resultados:
         try:
-            notifier.notificar_scanner(
-                par=r["par"],
-                senal=r["senal"],
-                estrategia=r["estrategia"],
-                metricas=r["metricas"],
-                analisis=r["analisis"]["analisis"],
-                nivel_atencion=r["analisis"]["nivel_atencion"],
-                alertas=r["analisis"]["alertas"],
-                timeframe=r["timeframe"],
-                chart_png=r.get("chart_png"),
-            )
+            if "situaciones" in r:
+                # Set v2: un mensaje por ticker con todas las situaciones nuevas
+                notifier.notificar_situaciones(
+                    par=r["par"],
+                    fecha_vela=r["fecha_vela"],
+                    situaciones=r["situaciones"],
+                    activas_previas=r["activas_previas"],
+                    prioritaria=r["prioritaria"],
+                    metricas=r["metricas"],
+                    analisis=r["analisis"]["analisis"],
+                    nivel_atencion=r["analisis"]["nivel_atencion"],
+                    alertas=r["analisis"]["alertas"],
+                    chart_png=r.get("chart_png"),
+                )
+            else:
+                # Set v1: un mensaje por estrategia
+                notifier.notificar_scanner(
+                    par=r["par"],
+                    senal=r["senal"],
+                    estrategia=r["estrategia"],
+                    metricas=r["metricas"],
+                    analisis=r["analisis"]["analisis"],
+                    nivel_atencion=r["analisis"]["nivel_atencion"],
+                    alertas=r["analisis"]["alertas"],
+                    timeframe=r["timeframe"],
+                    chart_png=r.get("chart_png"),
+                )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Error en notificar_scanner para %s/%s: %s", r["par"], r["estrategia"], exc)
+            log.warning("Error notificando alerta de %s: %s", r["par"], exc)
 
 
 def run(escanear_ahora: bool = False) -> None:

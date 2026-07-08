@@ -1,19 +1,20 @@
 """
-Scanner 4H — Fase 4+.
+Scanner 1D — Fase 4+.
 
-Escanea múltiples activos (cripto + acciones) evaluando condiciones técnicas
-en el timeframe 4H. Soporta cuatro estrategias configurables via .env:
+Escanea múltiples activos (cripto + acciones) evaluando condiciones técnicas.
+Las estrategias están versionadas en src/strategies/ y se eligen con
+SCANNER_STRATEGY_SET en .env:
 
-  SCANNER_RSI_SOBREVENTA       — RSI < umbral          → alerta informativa (NONE)
-  SCANNER_RSI_SOBRECOMPRA      — RSI > umbral          → alerta informativa (NONE)
-  SCANNER_EMA20_TOQUE          — precio ± dist% EMA20  → alerta informativa (NONE)
-  SCANNER_EMA20_RSI_SOBREVENTA — EMA20 toque + RSI sob → señal LONG (con filtro 1D/1W)
+  v1 — 4 estrategias originales (RSI 4H, EMA20 1D; ver src/strategies/v1.py)
+  v2 — screener de situaciones técnicas 1D (default; ver docs/estrategias_v2.md)
 
-Alertas (senal_base=NONE): notifican siempre que la condición se cumpla en 4H,
-sin filtro de tendencia. El cerebro analiza qué significa sin imponer dirección.
-
-Señales (senal_base=LONG): requieren 1D y 1W alcistas. El cerebro contextualiza
-con sesgo alcista.
+Flujo v2 por activo:
+  1. Descarga 1D y descarta la vela en curso (solo velas CERRADAS)
+  2. Evalúa las 10 situaciones — todas informativas (senal_base=NONE)
+  3. Anti-duplicados: una situación ya alertada no se repite hasta resetearse
+     (estado persistido en SQLite, ver src/scanner_state.py)
+  4. Confluencia: 2+ situaciones simultáneas → alerta PRIORITARIA
+  5. Un solo mensaje por ticker: cerebro (contextualizar) + chart 1D
 
 Tipos de activos:
   - Cripto: "BTC/USDT" (ccxt/Binance)
@@ -27,7 +28,7 @@ Restricciones:
 
 import logging
 import os
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Optional
 
 import ccxt
@@ -35,50 +36,24 @@ import pandas as pd
 
 from src.brain import contextualizar
 from src.charting import generar_chart_png
+from src import scanner_state
+from src.strategies import get_strategy_set
+from src.strategies.base import Estrategia
+from src.strategies.indicadores import atr as _atr
+from src.strategies.indicadores import ema as _ema
+from src.strategies.indicadores import rsi as _rsi
+from src.strategies.indicadores import sma as _sma
 from src.types import ContextoMercado
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuración de estrategias
+# Parámetros de descarga
 # ---------------------------------------------------------------------------
-
-# Todas las estrategias disponibles (en orden de evaluación)
-_TODAS_ESTRATEGIAS: list[str] = [
-    "RSI_SOBREVENTA",
-    "RSI_SOBRECOMPRA",
-    "EMA20_TOQUE",
-    "EMA20_RSI_SOBREVENTA",
-]
-
-# Señal base por estrategia:
-#   NONE  → alerta informativa, sin filtro MTF, cerebro analiza sin dirección forzada
-#   LONG  → señal con filtro 1D/1W alcistas, cerebro enfoca perspectiva alcista
-_SENAL_BASE: dict[str, str] = {
-    "RSI_SOBREVENTA":       "NONE",
-    "RSI_SOBRECOMPRA":      "NONE",
-    "EMA20_TOQUE":          "NONE",
-    "EMA20_RSI_SOBREVENTA": "LONG",
-}
-
-# Timeframe de evaluación de cada estrategia
-_ESTRATEGIA_TF: dict[str, str] = {
-    "RSI_SOBREVENTA":       "4h",
-    "RSI_SOBRECOMPRA":      "4h",
-    "EMA20_TOQUE":          "1d",
-    "EMA20_RSI_SOBREVENTA": "4h",
-}
-
-# ---------------------------------------------------------------------------
-# Parámetros de indicadores
-# ---------------------------------------------------------------------------
-
-EMA20_PERIODO = 20
-EMA50_PERIODO = 50
-RSI_PERIODO   = 14
 
 N_VELAS_4H  = 200
 N_VELAS_1D  = 300
+N_VELAS_1D_V2 = 400  # v2 necesita 250 ruedas (52w) + warmup + margen
 N_VELAS_1H  = 200
 N_VELAS_1W  = 104
 VELAS_WARMUP = 50
@@ -86,29 +61,9 @@ VELAS_WARMUP = 50
 VENTANA_ESTRUCTURA  = 20
 N_PUNTOS_ESTRUCTURA = 5
 
-
-# ---------------------------------------------------------------------------
-# Helpers de entorno
-# ---------------------------------------------------------------------------
-
-def _estrategias_activas() -> list[str]:
-    """Lee las estrategias habilitadas en el entorno (SCANNER_<NOMBRE>=true)."""
-    return [
-        e for e in _TODAS_ESTRATEGIAS
-        if os.environ.get(f"SCANNER_{e}", "false").lower() == "true"
-    ]
-
-
-def _umbral_rsi_sobreventa() -> float:
-    return float(os.environ.get("SCANNER_RSI_SOBREVENTA_UMBRAL", "35"))
-
-
-def _umbral_rsi_sobrecompra() -> float:
-    return float(os.environ.get("SCANNER_RSI_SOBRECOMPRA_UMBRAL", "70"))
-
-
-def _umbral_dist_ema20() -> float:
-    return float(os.environ.get("SCANNER_EMA20_DISTANCIA_PCT", "2")) / 100
+EMA20_PERIODO = 20
+EMA50_PERIODO = 50
+RSI_PERIODO   = 14
 
 
 # ---------------------------------------------------------------------------
@@ -118,37 +73,6 @@ def _umbral_dist_ema20() -> float:
 def _es_accion(par: str) -> bool:
     """Ticker sin '/' → acción (ej. AAPL). Con '/' → cripto (ej. BTC/USDT)."""
     return "/" not in par
-
-
-# ---------------------------------------------------------------------------
-# Indicadores (pandas puro)
-# ---------------------------------------------------------------------------
-
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift(1)).abs(),
-        (low - close.shift(1)).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
-
-
-def _sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
 
 
 # ---------------------------------------------------------------------------
@@ -223,56 +147,21 @@ def _aplicar_warmup(df: pd.DataFrame) -> pd.DataFrame:
     return df.iloc[VELAS_WARMUP:] if len(df) > VELAS_WARMUP else df
 
 
-# ---------------------------------------------------------------------------
-# Evaluación de condiciones por estrategia
-# ---------------------------------------------------------------------------
-
-def _evaluar_estrategia(df_valid: pd.DataFrame, estrategia_id: str) -> tuple[bool, dict]:
+def _solo_velas_cerradas(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Evalúa si la última vela del df cumple la condición de la estrategia.
-
-    Returns:
-        (cumple, metricas) donde metricas incluye precio, rsi, ema20, dist_ema20_pct, vol_ratio.
+    Descarta la vela diaria en curso: una vela cuya fecha (UTC) es hoy o
+    posterior todavía no cerró. Las estrategias v2 solo evalúan velas cerradas.
     """
-    close     = df_valid["close"]
-    precio    = float(close.iloc[-1])
-    rsi_val   = float(_rsi(close, RSI_PERIODO).iloc[-1])
-    ema20_val = float(_ema(close, EMA20_PERIODO).iloc[-1])
-    dist_pct  = (precio - ema20_val) / ema20_val
-
-    vol_actual = float(df_valid["volume"].iloc[-1]) if "volume" in df_valid.columns else 0.0
-    vol_prom_s = _sma(df_valid["volume"], 20) if "volume" in df_valid.columns else pd.Series([1.0])
-    vol_prom   = float(vol_prom_s.iloc[-1]) if not vol_prom_s.empty else 1.0
-    vol_ratio  = vol_actual / vol_prom if vol_prom > 0 else 1.0
-
-    metricas = {
-        "precio":         precio,
-        "rsi":            rsi_val,
-        "ema20":          ema20_val,
-        "dist_ema20_pct": dist_pct * 100,
-        "vol_ratio":      vol_ratio,
-    }
-
-    if estrategia_id == "RSI_SOBREVENTA":
-        return rsi_val < _umbral_rsi_sobreventa(), metricas
-
-    elif estrategia_id == "RSI_SOBRECOMPRA":
-        return rsi_val > _umbral_rsi_sobrecompra(), metricas
-
-    elif estrategia_id == "EMA20_TOQUE":
-        return abs(dist_pct) <= _umbral_dist_ema20(), metricas
-
-    elif estrategia_id == "EMA20_RSI_SOBREVENTA":
-        cumple = abs(dist_pct) <= _umbral_dist_ema20() and rsi_val < _umbral_rsi_sobreventa()
-        return cumple, metricas
-
-    else:
-        log.warning("Estrategia desconocida: %s", estrategia_id)
-        return False, metricas
+    if df.empty:
+        return df
+    hoy = datetime.now(timezone.utc).date()
+    if df.index[-1].date() >= hoy:
+        return df.iloc[:-1]
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Filtro de tendencia MTF
+# Filtro de tendencia MTF (solo señales LONG/SHORT de la v1)
 # ---------------------------------------------------------------------------
 
 def _tendencia_alcista_1d(df: pd.DataFrame) -> bool:
@@ -402,32 +291,13 @@ def _construir_contexto_par(
 
 
 # ---------------------------------------------------------------------------
-# Función pública principal
+# Flujo v1 — estrategias originales (idéntico al comportamiento pre-refactor)
 # ---------------------------------------------------------------------------
 
-def escanear(pares: list[str]) -> list[dict]:
-    """
-    Escanea todos los activos con las estrategias habilitadas en .env.
+def _escanear_v1(pares: list[str], estrategias: list[Estrategia]) -> list[dict]:
+    activas_4h = [e for e in estrategias if e.timeframe == "4h"]
+    activas_1d = [e for e in estrategias if e.timeframe == "1d"]
 
-    Flujo por activo:
-      1. Descarga 4H → evalúa estrategias 4H (RSI_SOBREVENTA, RSI_SOBRECOMPRA, EMA20_RSI_SOBREVENTA)
-      2. Descarga 1D → evalúa estrategias 1D (EMA20_TOQUE) + sirve para filtro MTF
-      3. Descarga 1W y 1H solo si algo pasó
-      4. Filtro MTF: alertas (NONE) siempre pasan; señales (LONG) requieren 1D + 1W alcistas
-      5. Llama al cerebro (contextualizar) y agrega al resultado
-
-    Returns:
-        Lista de dicts: {par, estrategia, senal, timeframe, metricas, analisis}
-    """
-    activas = _estrategias_activas()
-    if not activas:
-        log.warning("No hay estrategias activas. Configurar SCANNER_* en .env")
-        return []
-
-    activas_4h = [e for e in activas if _ESTRATEGIA_TF[e] == "4h"]
-    activas_1d = [e for e in activas if _ESTRATEGIA_TF[e] == "1d"]
-
-    log.info("Estrategias activas: %s", ", ".join(activas))
     resultados: list[dict] = []
 
     for par in pares:
@@ -437,18 +307,18 @@ def escanear(pares: list[str]) -> list[dict]:
             df_4h = _descargar(par, "4h", N_VELAS_4H)
             df_4h_valid = _aplicar_warmup(df_4h)
 
-            pasaron: list[tuple[str, dict, str]] = []  # (estrategia, metricas, timeframe)
+            pasaron: list[tuple[Estrategia, dict]] = []
 
             for est in activas_4h:
-                cumple, metricas = _evaluar_estrategia(df_4h_valid, est)
+                cumple, metricas = est.evaluar(df_4h_valid)
                 if cumple:
                     log.info(
                         "%s — PASA 4H [%s]: rsi=%.1f dist_ema20=%.2f%%",
-                        par, est, metricas["rsi"], metricas["dist_ema20_pct"],
+                        par, est.id, metricas["rsi"], metricas["dist_ema20_pct"],
                     )
-                    pasaron.append((est, metricas, "4h"))
+                    pasaron.append((est, metricas))
                 else:
-                    log.debug("%s — descartado 4H [%s]", par, est)
+                    log.debug("%s — descartado 4H [%s]", par, est.id)
 
             # --- Paso 2: 1D (para estrategias 1D y/o filtro MTF de señales 4H) ---
             necesita_1d = bool(activas_1d) or bool(pasaron)
@@ -459,15 +329,15 @@ def escanear(pares: list[str]) -> list[dict]:
             df_1d_valid = _aplicar_warmup(df_1d)
 
             for est in activas_1d:
-                cumple, metricas = _evaluar_estrategia(df_1d_valid, est)
+                cumple, metricas = est.evaluar(df_1d_valid)
                 if cumple:
                     log.info(
                         "%s — PASA 1D [%s]: rsi=%.1f dist_ema20=%.2f%%",
-                        par, est, metricas["rsi"], metricas["dist_ema20_pct"],
+                        par, est.id, metricas["rsi"], metricas["dist_ema20_pct"],
                     )
-                    pasaron.append((est, metricas, "1d"))
+                    pasaron.append((est, metricas))
                 else:
-                    log.debug("%s — descartado 1D [%s]", par, est)
+                    log.debug("%s — descartado 1D [%s]", par, est.id)
 
             if not pasaron:
                 continue
@@ -478,47 +348,203 @@ def escanear(pares: list[str]) -> list[dict]:
             df_1w_valid = _aplicar_warmup(df_1w)
 
             # --- Paso 4: filtro MTF + contextualización ---
-            for est, metricas, tf in pasaron:
-                senal = _SENAL_BASE[est]
+            for est, metricas in pasaron:
+                senal = est.senal_base
 
                 if not _pasa_filtro_tendencia(df_1d_valid, df_1w_valid, senal):
                     log.info(
-                        "%s — [%s] no pasa filtro tendencia MTF (senal=%s)", par, est, senal
+                        "%s — [%s] no pasa filtro tendencia MTF (senal=%s)", par, est.id, senal
                     )
                     continue
 
-                log.info("%s — [%s] pasa MTF — contextualizando con cerebro...", par, est)
+                log.info("%s — [%s] pasa MTF — contextualizando con cerebro...", par, est.id)
 
                 contexto = _construir_contexto_par(par, df_4h, df_1d, df_1h, df_1w)
                 contexto["senal_base"] = senal
                 analisis = contextualizar(contexto)
 
                 # Chart: usa el df del timeframe de la estrategia
-                df_chart = df_1d if tf == "1d" else df_4h
+                df_chart = df_1d if est.timeframe == "1d" else df_4h
                 chart_png: "bytes | None" = None
                 try:
-                    chart_png = generar_chart_png(df_chart, par, tf)
+                    chart_png = generar_chart_png(df_chart, par, est.timeframe)
                 except Exception as exc_chart:
-                    log.warning("%s — [%s] no se pudo generar chart: %s", par, est, exc_chart)
+                    log.warning("%s — [%s] no se pudo generar chart: %s", par, est.id, exc_chart)
 
                 resultados.append({
-                    "par":        par,
-                    "estrategia": est,
-                    "senal":      senal,
-                    "timeframe":  tf,
-                    "metricas":   metricas,
-                    "analisis":   analisis,
-                    "chart_png":  chart_png,
+                    "par":          par,
+                    "strategy_set": "v1",
+                    "estrategia":   est.id,
+                    "senal":        senal,
+                    "timeframe":    est.timeframe,
+                    "metricas":     metricas,
+                    "analisis":     analisis,
+                    "chart_png":    chart_png,
                 })
                 log.info(
-                    "%s — [%s] agregado (nivel=%s)", par, est, analisis["nivel_atencion"]
+                    "%s — [%s] agregado (nivel=%s)", par, est.id, analisis["nivel_atencion"]
                 )
 
         except Exception as exc:  # noqa: BLE001
             log.error("Error escaneando %s: %s", par, exc, exc_info=True)
             continue
 
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+# Flujo v2 — screener de situaciones técnicas 1D
+# ---------------------------------------------------------------------------
+
+def _escanear_v2(pares: list[str], estrategias: list[Estrategia]) -> list[dict]:
+    db_path = os.environ.get("DB_PATH", "trading_brain.db")
+    scanner_state.init(db_path)
+
+    resultados: list[dict] = []
+
+    for par in pares:
+        log.info("Escaneando %s...", par)
+        try:
+            aplicables = [
+                e for e in estrategias if not (e.solo_acciones and not _es_accion(par))
+            ]
+            if not aplicables:
+                continue
+
+            # --- Paso 1: 1D, solo velas cerradas ---
+            df_1d = _solo_velas_cerradas(_descargar(par, "1d", N_VELAS_1D_V2))
+            df_valid = _aplicar_warmup(df_1d)
+            if df_valid.empty:
+                log.warning("%s — sin velas cerradas suficientes", par)
+                continue
+
+            # --- Paso 2: evaluar situaciones ---
+            disparadas: list[tuple[Estrategia, dict]] = []
+            for est in aplicables:
+                cumple, metricas = est.evaluar(df_valid)
+                if cumple:
+                    log.info("%s — CUMPLE [%s]: %s", par, est.id, metricas.get("detalle"))
+                    disparadas.append((est, metricas))
+
+            ids_disparadas = {e.id for e, _ in disparadas}
+
+            # --- Paso 3: anti-duplicados (no re-alertar situaciones activas) ---
+            nuevas = [
+                (e, m) for e, m in disparadas
+                if not scanner_state.estaba_activa(db_path, par, e.id)
+            ]
+            ids_nuevas = {e.id for e, _ in nuevas}
+
+            for est in aplicables:
+                scanner_state.actualizar(
+                    db_path, par, est.id,
+                    activa=est.id in ids_disparadas,
+                    alerto=est.id in ids_nuevas,
+                )
+
+            if not nuevas:
+                if disparadas:
+                    log.info(
+                        "%s — %d situación(es) siguen activas, ya alertadas: %s",
+                        par, len(disparadas), ", ".join(sorted(ids_disparadas)),
+                    )
+                continue
+
+            # --- Paso 4: confluencia ---
+            prioritaria = len(disparadas) >= 2
+            activas_previas = [
+                e.nombre for e, _ in disparadas if e.id not in ids_nuevas
+            ]
+
+            # --- Paso 5: contexto MTF + cerebro (una sola llamada por ticker) ---
+            df_4h = _descargar(par, "4h", N_VELAS_4H)
+            df_1h = _descargar(par, "1h", N_VELAS_1H)
+            df_1w = _descargar(par, "1w", N_VELAS_1W)
+
+            contexto = _construir_contexto_par(par, df_4h, df_1d, df_1h, df_1w)
+            contexto["senal_base"] = "NONE"
+            contexto["situaciones_detectadas"] = [
+                {"id": e.id, "nombre": e.nombre, "detalle": m.get("detalle", {})}
+                for e, m in disparadas
+            ]
+            analisis = contextualizar(contexto)
+
+            chart_png: "bytes | None" = None
+            try:
+                chart_png = generar_chart_png(df_1d, par, "1d")
+            except Exception as exc_chart:
+                log.warning("%s — no se pudo generar chart: %s", par, exc_chart)
+
+            resultados.append({
+                "par":             par,
+                "strategy_set":    "v2",
+                "senal":           "NONE",
+                "timeframe":       "1d",
+                "fecha_vela":      df_valid.index[-1].date().isoformat(),
+                "prioritaria":     prioritaria,
+                "situaciones": [
+                    {
+                        "id":      e.id,
+                        "nombre":  e.nombre,
+                        "detalle": m.get("detalle", {}),
+                    }
+                    for e, m in nuevas
+                ],
+                "activas_previas": activas_previas,
+                "metricas":        nuevas[0][1],  # contexto de indicadores del ticker
+                "analisis":        analisis,
+                "chart_png":       chart_png,
+            })
+            log.info(
+                "%s — %d situación(es) nueva(s)%s (nivel=%s)",
+                par, len(nuevas),
+                " [PRIORITARIA]" if prioritaria else "",
+                analisis["nivel_atencion"],
+            )
+
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error escaneando %s: %s", par, exc, exc_info=True)
+            continue
+
+    return resultados
+
+
+# ---------------------------------------------------------------------------
+# Función pública principal
+# ---------------------------------------------------------------------------
+
+def escanear(pares: list[str]) -> list[dict]:
+    """
+    Escanea todos los activos con el set de estrategias activo
+    (SCANNER_STRATEGY_SET en .env: "v1" | "v2").
+
+    Returns:
+        v1 → lista de dicts {par, strategy_set, estrategia, senal, timeframe,
+             metricas, analisis, chart_png}
+        v2 → lista de dicts {par, strategy_set, senal, timeframe, fecha_vela,
+             prioritaria, situaciones, activas_previas, metricas, analisis,
+             chart_png} — un dict por ticker con situaciones nuevas.
+    """
+    from src.strategies import get_estrategias
+
+    version = get_strategy_set()
+    estrategias = get_estrategias()
+    if not estrategias:
+        log.warning("No hay estrategias activas (set=%s).", version)
+        return []
+
     log.info(
-        "Scanner completado: %d alertas/señales en %d activos", len(resultados), len(pares)
+        "Set de estrategias: %s — activas: %s",
+        version, ", ".join(e.id for e in estrategias),
+    )
+
+    if version == "v1":
+        resultados = _escanear_v1(pares, estrategias)
+    else:
+        resultados = _escanear_v2(pares, estrategias)
+
+    log.info(
+        "Scanner completado (%s): %d alertas en %d activos",
+        version, len(resultados), len(pares),
     )
     return resultados
