@@ -61,6 +61,18 @@ def estaba_activa(db_path: str, par: str, situacion: str) -> bool:
     return bool(row and row[0])
 
 
+def contar_activas(db_path: str) -> int:
+    """Cantidad de situaciones actualmente activas (ya alertadas, sin resetear)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM scanner_situaciones WHERE activa = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return int(row[0]) if row else 0
+
+
 def actualizar(db_path: str, par: str, situacion: str, activa: bool, alerto: bool = False) -> None:
     """
     Registra el estado de la situación tras un escaneo.

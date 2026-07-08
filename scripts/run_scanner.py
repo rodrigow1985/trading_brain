@@ -24,8 +24,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from src import notifier
+from src import notifier, scanner_state
 from src.scanner import escanear
+from src.strategies import get_strategy_set
 from src.watchlist import TODOS as PARES
 
 logging.basicConfig(
@@ -114,6 +115,21 @@ def run(escanear_ahora: bool = False) -> None:
             _notificar_resultados(resultados)
         else:
             log.info("[Ciclo %d] Sin señales confirmadas en esta vela.", ciclo)
+
+        # Heartbeat: confirma que la corrida terminó, haya o no alertas nuevas
+        try:
+            if get_strategy_set() == "v2":
+                n_nuevas = sum(len(r["situaciones"]) for r in resultados)
+                db_path = os.environ.get("DB_PATH", "trading_brain.db")
+                n_activas = scanner_state.contar_activas(db_path)
+            else:
+                n_nuevas = len(resultados)
+                n_activas = None
+            notifier.notificar_resumen_scanner(
+                n_activos=len(PARES), n_nuevas=n_nuevas, n_activas=n_activas,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Error enviando resumen del scanner: %s", exc)
 
 
 if __name__ == "__main__":

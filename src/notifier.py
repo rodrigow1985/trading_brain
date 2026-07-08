@@ -405,6 +405,28 @@ def notificar_situaciones(
         _enviar(texto)
 
 
+def notificar_resumen_scanner(
+    n_activos: int,
+    n_nuevas: int,
+    n_activas: "int | None" = None,
+) -> None:
+    """
+    Heartbeat al final de cada corrida del scanner: confirma que corrió aunque
+    no haya alertas nuevas (el silencio del anti-duplicados no es distinguible
+    de una falla sin este mensaje).
+    """
+    ahora = datetime.now(_TZ_ARG).strftime("%d/%m %H:%M")
+    icono = "📬" if n_nuevas > 0 else "✅"
+    lineas = [
+        f"{icono} <b>Scanner diario completado</b> — {ahora} (ARG)",
+        f"Activos escaneados: {n_activos}",
+        f"Situaciones nuevas: <b>{n_nuevas}</b>",
+    ]
+    if n_activas is not None:
+        lineas.append(f"Situaciones activas (ya alertadas): {n_activas}")
+    _enviar("\n".join(lineas))
+
+
 def notificar_fallback(par: str, razon: str) -> None:
     """Cuando el cerebro activa el fallback."""
     _enviar(
