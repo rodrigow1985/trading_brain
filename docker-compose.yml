@@ -17,3 +17,9 @@ services:
   # command: python scripts/run_scheduler.py
   # o también:
   # command: python -m src.scheduler
+
+  # Scanner diario (situaciones técnicas 1D)
+  # docker compose run -d --rm brain python scripts/run_scanner.py
+
+  # Bot de Telegram (/buffett TICKER)
+  # docker compose run -d --rm brain python scripts/telegram_bot.py

@@ -1033,3 +1033,227 @@ def analizar(contexto: ContextoMercado) -> DecisionCerebro:
         decision["conviccion"],
     )
     return decision
+
+
+# ---------------------------------------------------------------------------
+# Análisis Buffett (value investing) — modo texto libre
+#
+# A diferencia del cerebro y el scanner (tool use / JSON), este análisis
+# devuelve texto formateado para Telegram. El contexto fundamental lo arma
+# src/fundamentals.py — el LLM nunca busca datos por su cuenta.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT_BUFFETT = """\
+Actuás como Warren Buffett analizando una empresa bajo Value Investing.
+Aplicá estrictamente este marco:
+
+FASE I — Círculo de competencia: ¿negocio simple y predecible, sin depender
+de hype/tendencias? Si es ambiguo, descartar.
+
+FASE II — Moat (ventaja competitiva duradera): evaluar marca, ventaja de
+costos, costos de cambio, barreras regulatorias. Verificar con métricas
+consistentes en el tiempo: margen bruto alto y estable, margen operativo
+superior al sector, ROIC >> WACC, ROE elevado y estable, crecimiento de EPS
+sostenido incluso en recesiones. Sin moat real → descartar sin importar el precio.
+
+FASE III — Calidad de gestión (Test del Dólar Retenido): cada dólar retenido
+debe crear >=1 dólar de valor de mercado. Evaluar: reinversión disciplinada
+(no "empire-building"), adquisiciones a precio justo, recompras solo si el
+precio está bien por debajo del valor intrínseco, dividendos consistentes si
+no hay mejor uso del capital.
+
+FASE IV — Valoración y margen de seguridad:
+Owner Earnings = Net Income + D&A - CapEx de mantenimiento
+Valor intrínseco ~= Owner Earnings normalizadas x múltiplo (20-25x si moat
+ancha y crecimiento 5%+; 15-20x moat sólida/crecimiento moderado; 10-15x moat
+media; 8-12x moat estrecha; <8x cíclico/en declive)
+Margen de seguridad exigido: 20-30% de descuento para empresas excepcionales
+y predecibles, 40-50% para empresas con más incertidumbre. Si no se puede
+estimar el valor intrínseco con confianza -> no invertir.
+
+FASE V — Entrada en DCA:
+Precio Máximo = Valor Intrínseco x (1 - Margen de Seguridad)
+Nivel 1 (entrada principal): Pmax a Pmax x 0.90
+Nivel 2 (acumulación agresiva): Pmax x 0.90 a Pmax x 0.80
+Nivel 3 (compra final): Pmax x 0.80 a Pmax x 0.70
+Nivel 4 (oportunidad mayor, opcional): < Pmax x 0.70
+
+Reglas operativas:
+- Usá EXCLUSIVAMENTE los datos del contexto JSON provisto (precio actual,
+  márgenes, ROE, EPS, owner earnings por año, dividendos, recompras). NUNCA
+  inventes un número que no esté en el contexto. Si un dato clave falta,
+  decilo y ajustá la confianza del análisis.
+- El campo "advertencias" del contexto lista limitaciones de los datos —
+  tenelas en cuenta (ej. capex total, no solo de mantenimiento).
+- Sé directo y breve: esto se envía por Telegram, no es un informe extenso.
+- Cerrá siempre con veredicto: COMPRARÍA (con niveles DCA) / NO COMPRARÍA
+  (sin moat o sin margen de seguridad) / ESPERAR CORRECCIÓN.
+- Cerrá siempre con: "Análisis educativo, no es recomendación de inversión."
+
+Formato de respuesta (Telegram, con emojis, usar <b>negrita</b> HTML):
+
+🎩 <b>WARREN BUFFETT ANALYSIS – {TICKER}</b>
+
+📊 Precio actual: $X
+🧠 Círculo de competencia: [breve]
+🏰 Moat: [breve, con métrica clave]
+👔 Gestión / Test del dólar retenido: [breve]
+💰 Owner Earnings y múltiplo aplicado: [breve]
+🛡️ Valor intrínseco vs. margen de seguridad: [cálculo breve]
+
+✅ <b>Veredicto:</b> [...]
+
+🎯 <b>DCA sugerido:</b>
+- Nivel 1: $X
+- Nivel 2: $Y
+- Nivel 3: $Z
+
+⚠️ Análisis educativo, no es recomendación de inversión.
+
+Respondé SOLO con el análisis en ese formato. Sin markdown (*, #), solo
+etiquetas HTML <b></b> y emojis. Máximo 1600 caracteres.
+"""
+
+
+def _llamar_anthropic_texto(system_prompt: str, user_message: str, max_tokens: int = 1500) -> "str | None":
+    import anthropic
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.error("ANTHROPIC_API_KEY no definida")
+        return None
+    model = os.environ.get("LLM_MODEL") or "claude-sonnet-4-6"
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            temperature=0.3,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return "".join(b.text for b in response.content if b.type == "text") or None
+    except Exception as exc:
+        logger.error("Error llamando a Anthropic (texto): %s", exc)
+        return None
+
+
+def _llamar_groq_texto(system_prompt: str, user_message: str, max_tokens: int = 1500) -> "str | None":
+    try:
+        from groq import Groq
+    except ImportError:
+        logger.error("SDK groq no instalado")
+        return None
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        logger.error("GROQ_API_KEY no definida")
+        return None
+    model_name = os.environ.get("LLM_MODEL") or "llama-3.3-70b-versatile"
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.3,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content or None
+    except Exception as exc:
+        if _es_rate_limit(exc):
+            logger.warning("Groq rate limit alcanzado (texto): %s", exc)
+            raise _RateLimitError(str(exc)) from exc
+        logger.error("Error llamando a Groq (texto): %s", exc)
+        return None
+
+
+def _llamar_gemini_texto(system_prompt: str, user_message: str, max_tokens: int = 1500) -> "str | None":
+    """Como _gemini_rest_post pero con salida de texto plano (sin JSON mime)."""
+    import time as _time
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        logger.error("GEMINI_API_KEY no definida")
+        return None
+
+    model = _modelo_gemini()
+    logger.info("Proveedor: gemini (REST, texto) | Modelo: %s", model)
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta"
+        f"/models/{model}:generateContent"
+    )
+    body = {
+        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0.3,
+            "thinkingConfig": {"thinkingBudget": 0},
+        },
+    }
+    for intento in range(3):
+        try:
+            resp = _req.post(url, params={"key": api_key}, json=body, timeout=60)
+            if resp.status_code == 503:
+                wait = 10 * (intento + 1)
+                logger.warning("Gemini 503 — reintento %d/3 en %ds", intento + 1, wait)
+                _time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            parts = data["candidates"][0]["content"]["parts"]
+            return "".join(p.get("text", "") for p in parts) or None
+        except Exception as exc:
+            logger.error("Error llamando a Gemini (texto): %s", exc)
+            return None
+    logger.error("Gemini 503 persistente después de 3 intentos")
+    return None
+
+
+def _llamar_proveedor_texto(system_prompt: str, user_message: str) -> "str | None":
+    """Despachador en modo texto con el mismo fallback Groq→Gemini."""
+    provider = os.environ.get("LLM_PROVIDER", "anthropic").lower().strip()
+    if provider == "anthropic":
+        return _llamar_anthropic_texto(system_prompt, user_message)
+    elif provider == "gemini":
+        return _llamar_gemini_texto(system_prompt, user_message)
+    elif provider == "groq":
+        try:
+            return _llamar_groq_texto(system_prompt, user_message)
+        except _RateLimitError:
+            if not os.environ.get("GEMINI_API_KEY", ""):
+                logger.error("Groq rate limit — GEMINI_API_KEY no configurada, sin fallback")
+                return None
+            logger.warning("Groq rate limit — fallback a Gemini (texto)")
+            return _llamar_gemini_texto(system_prompt, user_message)
+    else:
+        logger.error("LLM_PROVIDER desconocido: '%s'", provider)
+        return None
+
+
+def analizar_buffett(contexto_fundamental: dict) -> "str | None":
+    """
+    Análisis value investing estilo Buffett sobre el contexto fundamental
+    armado por src/fundamentals.py. Devuelve texto HTML para Telegram, o
+    None si el LLM no respondió (el caller decide el mensaje de error).
+    """
+    try:
+        contexto_json = json.dumps(contexto_fundamental, indent=1, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        logger.error("Error serializando contexto fundamental: %s", exc)
+        return None
+
+    ticker = contexto_fundamental.get("ticker", "?")
+    logger.info(
+        "Análisis Buffett — ticker=%s proveedor=%s",
+        ticker, os.environ.get("LLM_PROVIDER", "anthropic"),
+    )
+    user_message = (
+        f"Analizá la siguiente empresa con el marco de las 5 fases. "
+        f"Datos fundamentales reales (fuente: Yahoo Finance):\n\n{contexto_json}"
+    )
+    texto = _llamar_proveedor_texto(_SYSTEM_PROMPT_BUFFETT, user_message)
+    if texto:
+        texto = texto.strip()[:3500]
+    return texto or None
