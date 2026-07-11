@@ -9,6 +9,10 @@ Escribirle al bot: `/buffett KO` (cualquier ticker de Yahoo Finance).
 Solo acciones — el marco no aplica a cripto. Solo responde al chat de
 `TELEGRAM_CHAT_ID`; cualquier otro chat se ignora.
 
+Requiere un bot DEDICADO (`TELEGRAM_COMMAND_BOT_TOKEN`, creado con @BotFather),
+distinto del bot de alertas: el token de `TELEGRAM_BOT_TOKEN` ya tiene otro
+consumidor de `getUpdates` (top-briefing) y Telegram permite uno solo por bot.
+
 ```bash
 # Levantar el bot (long-polling de getUpdates)
 docker compose run -d --rm brain python scripts/telegram_bot.py

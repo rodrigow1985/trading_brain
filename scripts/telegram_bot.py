@@ -7,6 +7,11 @@ Escucha mensajes via long-polling (getUpdates) y responde comandos:
                         (fundamentals reales de yfinance + LLM)
     /help             — lista de comandos
 
+Usa su PROPIO bot de Telegram (TELEGRAM_COMMAND_BOT_TOKEN), separado del bot
+de alertas (TELEGRAM_BOT_TOKEN): el token de alertas lo comparte otro proceso
+con polling activo (top-briefing) y dos consumidores de getUpdates sobre el
+mismo token chocan con 409 Conflict. Sin fallback deliberadamente.
+
 Seguridad: solo responde a mensajes del chat configurado en TELEGRAM_CHAT_ID.
 Cualquier otro chat se ignora en silencio.
 
@@ -52,7 +57,7 @@ _AYUDA = (
 
 
 def _api(metodo: str) -> str:
-    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    token = os.environ["TELEGRAM_COMMAND_BOT_TOKEN"]
     return f"https://api.telegram.org/bot{token}/{metodo}"
 
 
@@ -154,10 +159,17 @@ def _procesar_mensaje(mensaje: dict, chat_autorizado: str) -> None:
 
 
 def run() -> None:
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    token = os.environ.get("TELEGRAM_COMMAND_BOT_TOKEN", "")
     chat_autorizado = os.environ.get("TELEGRAM_CHAT_ID", "")
     if not token or not chat_autorizado:
-        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID no configurados — saliendo")
+        log.error("TELEGRAM_COMMAND_BOT_TOKEN / TELEGRAM_CHAT_ID no configurados — saliendo")
+        sys.exit(1)
+    if token == os.environ.get("TELEGRAM_BOT_TOKEN", ""):
+        log.error(
+            "TELEGRAM_COMMAND_BOT_TOKEN es igual a TELEGRAM_BOT_TOKEN — ese token "
+            "ya tiene otro consumidor de getUpdates (409). Crear un bot dedicado "
+            "con @BotFather. Saliendo."
+        )
         sys.exit(1)
 
     log.info("=== Bot de Telegram iniciado — escuchando comandos (/buffett) ===")
